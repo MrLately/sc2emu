@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView
+        android:id="@+id/tvWaypointTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Waypoint"
+        android:textColor="#FFFFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvWaypointHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Altitude applies to this and following points."
+        android:textColor="#CCFFFFFF"
+        android:textSize="12sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tvWaypointAltitudeValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="60 m"
+            android:textColor="#FFFFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <com.discostuff.sc2emu.controls.VerticalSeekBar
+            android:id="@+id/seekWaypointAltitude"
+            android:layout_width="56dp"
+            android:layout_height="220dp"
+            android:layout_marginTop="6dp"
+            android:max="220" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/groupTerminalAction"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="14dp"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Last Point Behavior"
+            android:textColor="#E6FFFFFF"
+            android:textSize="12sp" />
+
+        <androidx.appcompat.widget.AppCompatSpinner
+            android:id="@+id/spTerminalAction"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:background="#22000000" />
+    </LinearLayout>
+</LinearLayout>

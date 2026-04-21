@@ -1,0 +1,26 @@
+package com.discostuff.sc2emu.flight
+
+data class FlightState(
+    val engineRunning: Boolean = false,
+    val discoveryOk: Boolean = false,
+    val controlsArmed: Boolean = false,
+    val txPackets: Long = 0,
+    val rxPackets: Long = 0,
+    val planeBatteryPercent: Int? = null,
+    val altitudeMeters: Float? = null,
+    val groundSpeedMps: Float? = null,
+    val planeLinkPercent: Int? = null,
+    val attitudeRollRad: Float? = null,
+    val attitudePitchRad: Float? = null,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val flyingState: Int? = null,
+    val landingState: Int? = null,
+    val mavlinkPlayingState: Int? = null,
+    val mavlinkFilePath: String? = null,
+    val mavlinkType: Int? = null,
+    val mavlinkPlayError: Int? = null,
+    val missionItemExecutedIndex: Int? = null,
+    val message: String = "ready",
+    val lastTelemetryAtMs: Long? = null,
+)

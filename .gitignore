@@ -1,0 +1,24 @@
+# IDE / editor
+*.iml
+.idea/
+.vscode/
+
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local machine config
+local.properties
+.tooling/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
