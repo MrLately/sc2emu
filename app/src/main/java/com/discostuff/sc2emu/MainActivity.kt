@@ -130,6 +130,7 @@ class MainActivity : ComponentActivity() {
         private const val MODEM_TELEMETRY_PATH = "/telemetry.json"
         private const val MODEM_TELEMETRY_POLL_MS = 2500L
         private const val MODEM_TELEMETRY_TIMEOUT_MS = 1200
+        private const val MODEM_TELEMETRY_UNAVAILABLE_GRACE_MS = 12_000L
         private const val TELEMETRY_WARN_AGE_MS = 3_500L
         private const val TELEMETRY_STALE_AGE_MS = 6_000L
         private const val ALERT_LOG_MAX_LINES = 120
@@ -406,6 +407,12 @@ class MainActivity : ComponentActivity() {
 
     @Volatile
     private var modemZt: String? = null
+
+    @Volatile
+    private var modemTelemetryLastSuccessAtMs: Long = 0L
+
+    @Volatile
+    private var modemTelemetryFirstFailureAtMs: Long = 0L
 
     private var pilotHomeLatitude: Double? = null
     private var pilotHomeLongitude: Double? = null
@@ -2996,7 +3003,10 @@ class MainActivity : ComponentActivity() {
                     .put("telemetry_age_ms", telemetryAgeMs)
                     .put("state_message", state.message)
                     .put("modem_signal_pct", modemSignalPercent)
-                    .put("modem_zt", modemZt),
+                    .put("modem_zt", modemZt)
+                    .put("modem_telemetry_unavailable", isModemTelemetryUnavailable())
+                    .put("modem_telemetry_last_success_at_ms", modemTelemetryLastSuccessAtMs.takeIf { it > 0L })
+                    .put("modem_telemetry_first_failure_at_ms", modemTelemetryFirstFailureAtMs.takeIf { it > 0L }),
             )
 
             put(
@@ -3314,6 +3324,10 @@ class MainActivity : ComponentActivity() {
             return SafetyBanner(SafetySeverity.WARN, "Plane link weak: $link%")
         }
 
+        if (isModemTelemetryUnavailable()) {
+            return SafetyBanner(SafetySeverity.INFO, "Modem telemetry unavailable. Core flight/video still works.")
+        }
+
         if (benchLockEnabled && !airborne) {
             return SafetyBanner(SafetySeverity.INFO, "Bench lock ON: takeoff blocked")
         }
@@ -3348,6 +3362,25 @@ class MainActivity : ComponentActivity() {
         modemTelemetryJob = null
     }
 
+    private fun isModemTelemetryUnavailable(nowMs: Long = System.currentTimeMillis()): Boolean {
+        val state = FlightSessionStore.state.value
+        if (!state.engineRunning || !state.discoveryOk) return false
+        val firstFailure = modemTelemetryFirstFailureAtMs
+        if (firstFailure <= 0L) return false
+        return (nowMs - firstFailure) >= MODEM_TELEMETRY_UNAVAILABLE_GRACE_MS
+    }
+
+    private fun markModemTelemetrySuccess(nowMs: Long = System.currentTimeMillis()) {
+        modemTelemetryLastSuccessAtMs = nowMs
+        modemTelemetryFirstFailureAtMs = 0L
+    }
+
+    private fun markModemTelemetryFailure(nowMs: Long = System.currentTimeMillis()) {
+        if (modemTelemetryFirstFailureAtMs <= 0L) {
+            modemTelemetryFirstFailureAtMs = nowMs
+        }
+    }
+
     private suspend fun pollModemTelemetryOnce() {
         val host = withContext(Dispatchers.Main) {
             etDiscoIp.text?.toString()?.trim().orEmpty()
@@ -3364,7 +3397,10 @@ class MainActivity : ComponentActivity() {
             connection.useCaches = false
 
             val code = connection.responseCode
-            if (code !in 200..299) return
+            if (code !in 200..299) {
+                markModemTelemetryFailure()
+                return
+            }
 
             val body = connection.inputStream.bufferedReader().use { it.readText() }
             val json = JSONObject(body)
@@ -3376,11 +3412,13 @@ class MainActivity : ComponentActivity() {
                 "D", "R" -> zt
                 else -> null
             }
+            markModemTelemetrySuccess()
 
             withContext(Dispatchers.Main) {
                 renderInfo(FlightSessionStore.state.value)
             }
         } catch (_: Exception) {
+            markModemTelemetryFailure()
             // Keep the previous values when endpoint is temporarily unavailable.
         } finally {
             connection.disconnect()
