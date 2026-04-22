@@ -59,8 +59,12 @@ import com.discostuff.sc2emu.controls.VerticalSeekBar
 import com.discostuff.sc2emu.controls.VirtualStickView
 import com.discostuff.sc2emu.flight.FlightConfig
 import com.discostuff.sc2emu.flight.FlightEngineService
+import com.discostuff.sc2emu.flight.FlightInputParsers
+import com.discostuff.sc2emu.flight.FlightPhase
+import com.discostuff.sc2emu.flight.FlightSettings
 import com.discostuff.sc2emu.flight.FlightSessionStore
 import com.discostuff.sc2emu.flight.FlightState
+import com.discostuff.sc2emu.flight.NavigateHomeState
 import com.discostuff.sc2emu.mission.MissionMavlinkBuilder
 import com.discostuff.sc2emu.video.RtpH264VideoReceiver
 import java.io.ByteArrayInputStream
@@ -130,6 +134,7 @@ class MainActivity : ComponentActivity() {
         private const val MODEM_TELEMETRY_PATH = "/telemetry.json"
         private const val MODEM_TELEMETRY_POLL_MS = 2500L
         private const val MODEM_TELEMETRY_TIMEOUT_MS = 1200
+        private const val MODEM_TELEMETRY_STALE_AGE_MS = 5000L
         private const val MODEM_TELEMETRY_UNAVAILABLE_GRACE_MS = 12_000L
         private const val TELEMETRY_WARN_AGE_MS = 3_500L
         private const val TELEMETRY_STALE_AGE_MS = 6_000L
@@ -277,17 +282,6 @@ class MainActivity : ComponentActivity() {
         val message: String,
     )
 
-    private data class FlightSettings(
-        val maxAltitudeMeters: Float,
-        val minAltitudeMeters: Float,
-        val maxDistanceMeters: Float,
-        val geofenceEnabled: Boolean,
-        val rthMinAltitudeMeters: Float,
-        val rthDelaySeconds: Int,
-        val loiterRadiusMeters: Int,
-        val loiterAltitudeMeters: Float,
-    )
-
     private lateinit var prefs: SharedPreferences
 
     private lateinit var etDiscoIp: EditText
@@ -390,7 +384,6 @@ class MainActivity : ComponentActivity() {
     private var missionAddMode = true
     private var missionToolsExpanded = false
     private var missionExecutionState = MissionExecutionState.IDLE
-    private var rthActive = false
     private var airborne = false
 
     private var pitchAxis = 0
@@ -414,8 +407,6 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var modemTelemetryFirstFailureAtMs: Long = 0L
 
-    private var pilotHomeLatitude: Double? = null
-    private var pilotHomeLongitude: Double? = null
     private var pilotPhoneLatitude: Double? = null
     private var pilotPhoneLongitude: Double? = null
     private var pilotPhoneAltitudeMeters: Double = 0.0
@@ -654,31 +645,40 @@ class MainActivity : ComponentActivity() {
         }
 
         btnApplyConfig.setOnClickListener {
-            val config = readConfigFromInputs() ?: run {
-                showStatusToast("invalid config")
+            val configResult = parseConfigInputs()
+            val config = configResult.value ?: run {
+                showStatusToast(configResult.error ?: "invalid config")
                 return@setOnClickListener
             }
-            val settings = readFlightSettingsFromInputs() ?: run {
-                showStatusToast("invalid flight settings")
+            val settingsResult = parseFlightSettingsInputs()
+            val settings = settingsResult.value ?: run {
+                showStatusToast(settingsResult.error ?: "invalid flight settings")
                 return@setOnClickListener
             }
             val oldConfig = readConfigFromPrefs()
             saveConfig(config)
             saveFlightSettings(settings)
             queueFlightSettingsApply(settings)
+            appendCommandEvent("Config applied ${FlightInputParsers.formatConfigSummary(config)}")
+            appendCommandEvent("Settings applied ${FlightInputParsers.formatSettingsSummary(settings)}")
 
             val state = FlightSessionStore.state.value
             val shouldRestart = state.engineRunning && oldConfig != null && oldConfig != config
 
             if (shouldRestart) {
+                val clearSessionState = oldConfig?.discoIp != config.discoIp
                 lifecycleScope.launch {
-                    autoStopEngine()
+                    autoStopEngine(clearSessionState = clearSessionState)
                     delay(250)
                     autoStartEngine()
                 }
             } else if (state.engineRunning && state.discoveryOk) {
                 applyPendingFlightSettingsIfReady()
             }
+
+            showStatusToast(
+                "Applied ${FlightInputParsers.formatSettingsSummary(settings)}",
+            )
 
             configVisible = false
             saveConfigVisible()
@@ -698,36 +698,64 @@ class MainActivity : ComponentActivity() {
         }
 
         btnTakeoffLand.setOnClickListener {
-            if (airborne) {
-                if (!ensureCriticalCommandReady("land", requireAirborne = true, requireFreshTelemetry = false)) {
-                    return@setOnClickListener
+            val state = FlightSessionStore.state.value
+            val phase = currentFlightPhase(state)
+            when {
+                phase.allowsTakeoffAbort -> {
+                    if (!ensureCriticalCommandReady("takeoff abort", requireAirborne = false, requireFreshTelemetry = false)) {
+                        return@setOnClickListener
+                    }
+                    sendSimpleAction(FlightEngineService.ACTION_LAND)
                 }
-                sendSimpleAction(FlightEngineService.ACTION_LAND)
-            } else {
-                if (benchLockEnabled) {
-                    showStatusToast("takeoff blocked: bench lock on")
-                    appendCommandEvent("Takeoff blocked (bench lock)")
-                    return@setOnClickListener
+
+                phase.allowsLandCommand -> {
+                    if (!ensureCriticalCommandReady("land", requireAirborne = true, requireFreshTelemetry = false)) {
+                        return@setOnClickListener
+                    }
+                    sendSimpleAction(FlightEngineService.ACTION_LAND)
                 }
-                if (!ensureCriticalCommandReady("takeoff", requireAirborne = false, requireFreshTelemetry = true)) {
-                    return@setOnClickListener
+
+                phase.allowsTakeoffStart -> {
+                    if (benchLockEnabled) {
+                        showStatusToast("takeoff blocked: bench lock on")
+                        appendCommandEvent("Takeoff blocked (bench lock)")
+                        return@setOnClickListener
+                    }
+                    if (!ensureCriticalCommandReady("takeoff", requireAirborne = false, requireFreshTelemetry = true)) {
+                        return@setOnClickListener
+                    }
+                    showTakeoffConfirmation()
                 }
-                showTakeoffConfirmation()
+
+                else -> {
+                    showCriticalCommandBlocked("takeoff/land", "aircraft is ${phase.label}")
+                }
             }
         }
 
         btnRth.setOnClickListener {
-            if (!ensureCriticalCommandReady("rth", requireAirborne = true, requireFreshTelemetry = true)) {
+            val state = FlightSessionStore.state.value
+            val phase = currentFlightPhase(state)
+            val navigateHomeState = currentNavigateHomeState(state)
+            if (navigateHomeState.isActive) {
+                if (!ensureCriticalCommandReady("rth stop", requireAirborne = false, requireFreshTelemetry = true)) {
+                    return@setOnClickListener
+                }
+                sendSimpleAction(FlightEngineService.ACTION_RTH_STOP)
                 return@setOnClickListener
             }
-            if (rthActive) {
-                sendSimpleAction(FlightEngineService.ACTION_RTH_STOP)
-                rthActive = false
-            } else {
-                sendSimpleAction(FlightEngineService.ACTION_RTH_START)
-                rthActive = true
+            if (navigateHomeState == NavigateHomeState.UNAVAILABLE) {
+                showCriticalCommandBlocked("rth start", "navigate-home unavailable")
+                return@setOnClickListener
             }
-            btnRth.text = if (rthActive) "RTH Off" else "RTH"
+            if (!phase.allowsNavigateHomeStart) {
+                showCriticalCommandBlocked("rth start", "aircraft is ${phase.label}")
+                return@setOnClickListener
+            }
+            if (!ensureCriticalCommandReady("rth start", requireAirborne = false, requireFreshTelemetry = true)) {
+                return@setOnClickListener
+            }
+            sendSimpleAction(FlightEngineService.ACTION_RTH_START)
         }
 
         btnMissionCtrlStart.setOnClickListener {
@@ -1123,7 +1151,12 @@ class MainActivity : ComponentActivity() {
         }
         if (missionExecutionState == MissionExecutionState.RUNNING || missionUploadJob?.isActive == true) return
 
-        if (!ensureCriticalCommandReady("mission start", requireAirborne = true, requireFreshTelemetry = true)) {
+        val phase = currentFlightPhase()
+        if (!phase.allowsMissionStart) {
+            showCriticalCommandBlocked("mission start", "aircraft is ${phase.label}")
+            return
+        }
+        if (!ensureCriticalCommandReady("mission start", requireAirborne = false, requireFreshTelemetry = true)) {
             return
         }
 
@@ -1144,8 +1177,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val config = readConfigFromInputs() ?: readConfigFromPrefs() ?: run {
-            showStatusToast("set plane ip first")
+        val configResult = parseConfigInputs()
+        val config = configResult.value ?: run {
+            showStatusToast(configResult.error ?: "invalid config")
             return
         }
 
@@ -1182,20 +1216,34 @@ class MainActivity : ComponentActivity() {
         requireFreshTelemetry: Boolean,
     ): Boolean {
         val state = FlightSessionStore.state.value
+        val phase = currentFlightPhase(state)
         val reason = when {
             reconnectInProgress -> "reconnecting"
             !state.engineRunning -> "engine not running"
             !state.discoveryOk -> "discovery not ready"
-            requireAirborne && !airborne -> "aircraft is not airborne"
+            !state.transportReady -> "transport not ready"
+            requireAirborne && !phase.isAirborne -> "aircraft is ${phase.label}"
             requireFreshTelemetry && !hasFreshTelemetry(state) -> "telemetry stale"
             else -> null
         }
         if (reason != null) {
-            showStatusToast("$actionLabel blocked: $reason")
-            appendCommandEvent("${actionLabel.uppercase(Locale.US)} blocked: $reason")
+            showCriticalCommandBlocked(actionLabel, reason)
             return false
         }
         return true
+    }
+
+    private fun currentFlightPhase(state: FlightState = FlightSessionStore.state.value): FlightPhase {
+        return FlightPhase.fromArsdk(state.flyingState)
+    }
+
+    private fun currentNavigateHomeState(state: FlightState = FlightSessionStore.state.value): NavigateHomeState {
+        return NavigateHomeState.fromArsdk(state.navigateHomeState)
+    }
+
+    private fun showCriticalCommandBlocked(actionLabel: String, reason: String) {
+        showStatusToast("$actionLabel blocked: $reason")
+        appendCommandEvent("${actionLabel.uppercase(Locale.US)} blocked: $reason")
     }
 
     private fun hasFreshTelemetry(state: FlightState): Boolean {
@@ -1210,7 +1258,11 @@ class MainActivity : ComponentActivity() {
             return MissionPreflightResult(ok = false, message = "need at least 2 generated waypoints")
         }
 
-        val settings = readFlightSettingsFromInputs() ?: readFlightSettingsFromPrefs()
+        val settingsResult = parseFlightSettingsInputs()
+        val settings = settingsResult.value ?: return MissionPreflightResult(
+            ok = false,
+            message = settingsResult.error ?: "invalid flight settings",
+        )
         val maxAltitude = settings.maxAltitudeMeters
         val minAltitude = settings.minAltitudeMeters
 
@@ -1273,17 +1325,11 @@ class MainActivity : ComponentActivity() {
             return GeoPoint(phoneLat, phoneLon)
         }
 
-        val homeLat = pilotHomeLatitude
-        val homeLon = pilotHomeLongitude
+        val state = FlightSessionStore.state.value
+        val homeLat = state.homeLatitude
+        val homeLon = state.homeLongitude
         if (homeLat != null && homeLon != null && homeLat.isFinite() && homeLon.isFinite()) {
             return GeoPoint(homeLat, homeLon)
-        }
-
-        val state = FlightSessionStore.state.value
-        val planeLat = state.latitude
-        val planeLon = state.longitude
-        if (planeLat != null && planeLon != null && planeLat.isFinite() && planeLon.isFinite()) {
-            return GeoPoint(planeLat, planeLon)
         }
         return null
     }
@@ -1311,7 +1357,12 @@ class MainActivity : ComponentActivity() {
             }
 
             MissionExecutionState.PAUSED -> {
-                if (!ensureCriticalCommandReady("mission resume", requireAirborne = true, requireFreshTelemetry = true)) {
+                val phase = currentFlightPhase()
+                if (!phase.allowsMissionStart) {
+                    showCriticalCommandBlocked("mission resume", "aircraft is ${phase.label}")
+                    return
+                }
+                if (!ensureCriticalCommandReady("mission resume", requireAirborne = false, requireFreshTelemetry = true)) {
                     return
                 }
                 val filePath = missionFilePath
@@ -2715,8 +2766,9 @@ class MainActivity : ComponentActivity() {
                 if (!ensureCriticalCommandReady("takeoff", requireAirborne = false, requireFreshTelemetry = true)) {
                     return@setPositiveButton
                 }
-                if (airborne) {
-                    showStatusToast("takeoff blocked: aircraft already airborne")
+                val phase = currentFlightPhase()
+                if (!phase.allowsTakeoffStart) {
+                    showStatusToast("takeoff blocked: aircraft is ${phase.label}")
                     return@setPositiveButton
                 }
                 sendArmState(true)
@@ -2732,8 +2784,9 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
                 FlightSessionStore.state.collect { state ->
-                    airborne = state.flyingState?.let { it != 0 } ?: false
+                    airborne = currentFlightPhase(state).isAirborne
                     updateTakeoffButtonUi()
+                    updateRthButtonUi(state)
                     updateConnectionPhaseUi(state)
                     appendBenchLogIfStateMessageChanged(state)
 
@@ -2784,7 +2837,8 @@ class MainActivity : ComponentActivity() {
     private fun updateConnectionPhaseUi(state: FlightState) {
         val phase = when {
             reconnectInProgress -> "RECONNECTING"
-            state.engineRunning && state.discoveryOk -> "READY"
+            state.engineRunning && state.discoveryOk && state.transportReady -> "READY"
+            state.engineRunning && state.discoveryOk -> "TRANSPORT"
             state.engineRunning && !state.discoveryOk -> "DISCOVERY"
             else -> "OFFLINE"
         }
@@ -2843,6 +2897,7 @@ class MainActivity : ComponentActivity() {
             appendLine()
             appendLine("- ${if (state.engineRunning) "PASS" else "FAIL"} Engine running")
             appendLine("- ${if (state.discoveryOk) "PASS" else "FAIL"} Discovery ready")
+            appendLine("- ${if (state.transportReady) "PASS" else "FAIL"} Transport ready")
             appendLine("- ${if (hasFreshTelemetry(state)) "PASS" else "FAIL"} Fresh telemetry")
             appendLine("- ${if (surfaceAvailable) "PASS" else "FAIL"} Video surface ready")
             appendLine("- ${if (FlightSessionStore.state.value.controlsArmed) "WARN" else "PASS"} Controls disarmed on bench")
@@ -2926,14 +2981,15 @@ class MainActivity : ComponentActivity() {
 
     private fun buildDiagnosticsSnapshotJson(): JSONObject {
         val state = FlightSessionStore.state.value
-        val config = readConfigFromInputs() ?: readConfigFromPrefs()
-        val settings = readFlightSettingsFromInputs() ?: readFlightSettingsFromPrefs()
+        val config = readConfigFromPrefs() ?: readConfigFromInputs()
+        val settings = readFlightSettingsFromPrefs()
         val anchorNodes = missionNodes.toList()
         val executionNodes = buildExecutionMissionNodes()
         val hasMission = executionNodes.size >= 2
         val softPreflight = if (hasMission) runMissionPreflight(strictGeofence = false) else null
         val strictPreflight = if (hasMission) runMissionPreflight(strictGeofence = true) else null
         val telemetryAgeMs = telemetryAgeMs(state)
+        val modemTelemetryFresh = hasFreshModemTelemetry()
 
         return JSONObject().apply {
             put("timestamp_unix_ms", System.currentTimeMillis())
@@ -2984,10 +3040,11 @@ class MainActivity : ComponentActivity() {
                 JSONObject()
                     .put("engine_running", state.engineRunning)
                     .put("discovery_ok", state.discoveryOk)
+                    .put("transport_ready", state.transportReady)
                     .put("controls_armed", state.controlsArmed)
                     .put("tx_packets", state.txPackets)
                     .put("rx_packets", state.rxPackets)
-                    .put("plane_battery_pct", state.planeBatteryPercent ?: modemPlaneBatteryPercent)
+                    .put("plane_battery_pct", state.planeBatteryPercent ?: modemPlaneBatteryPercent.takeIf { modemTelemetryFresh })
                     .put("plane_link_pct", state.planeLinkPercent)
                     .put("ground_speed_mps", state.groundSpeedMps)
                     .put("altitude_m", state.altitudeMeters)
@@ -2995,15 +3052,21 @@ class MainActivity : ComponentActivity() {
                     .put("longitude", state.longitude)
                     .put("flying_state", state.flyingState)
                     .put("landing_state", state.landingState)
+                    .put("navigate_home_state", state.navigateHomeState)
+                    .put("navigate_home_reason", state.navigateHomeReason)
                     .put("mavlink_playing_state", state.mavlinkPlayingState)
                     .put("mavlink_file_path", state.mavlinkFilePath)
                     .put("mavlink_type", state.mavlinkType)
                     .put("mavlink_play_error", state.mavlinkPlayError)
                     .put("mission_item_executed_index", state.missionItemExecutedIndex)
+                    .put("home_latitude", state.homeLatitude)
+                    .put("home_longitude", state.homeLongitude)
+                    .put("home_altitude_m", state.homeAltitudeMeters)
                     .put("telemetry_age_ms", telemetryAgeMs)
                     .put("state_message", state.message)
-                    .put("modem_signal_pct", modemSignalPercent)
-                    .put("modem_zt", modemZt)
+                    .put("modem_signal_pct", modemSignalPercent.takeIf { modemTelemetryFresh })
+                    .put("modem_zt", modemZt.takeIf { modemTelemetryFresh })
+                    .put("modem_telemetry_stale", !modemTelemetryFresh && modemTelemetryLastSuccessAtMs > 0L)
                     .put("modem_telemetry_unavailable", isModemTelemetryUnavailable())
                     .put("modem_telemetry_last_success_at_ms", modemTelemetryLastSuccessAtMs.takeIf { it > 0L })
                     .put("modem_telemetry_first_failure_at_ms", modemTelemetryFirstFailureAtMs.takeIf { it > 0L }),
@@ -3017,8 +3080,9 @@ class MainActivity : ComponentActivity() {
                     .put("phone_altitude_m", pilotPhoneAltitudeMeters)
                     .put("phone_signal_pct", readPhoneSignalPercent())
                     .put("phone_battery_pct", readPhoneBatteryPercent())
-                    .put("home_latitude", pilotHomeLatitude)
-                    .put("home_longitude", pilotHomeLongitude),
+                    .put("home_latitude", state.homeLatitude)
+                    .put("home_longitude", state.homeLongitude)
+                    .put("home_altitude_m", state.homeAltitudeMeters),
             )
 
             put(
@@ -3149,19 +3213,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderInfo(state: FlightState) {
-        val speed = state.groundSpeedMps?.let { String.format(Locale.US, "%.1fm/s", it) } ?: "--"
+        val safeSpeedMps = state.groundSpeedMps?.takeIf { it.isFinite() && it in 0f..150f }
+        val speed = safeSpeedMps?.let { String.format(Locale.US, "%.1fm/s", it) } ?: "--"
         val safeAltitudeMeters = state.altitudeMeters?.takeIf { it.isFinite() && it in -1000f..15000f }
         val elev = safeAltitudeMeters?.let { String.format(Locale.US, "%.1fm", it) } ?: "--"
         val distanceMeters = computeDistanceFromPilotMeters(state.latitude, state.longitude)
         val distance = formatDistance(distanceMeters)
         val planeLinkPercent = state.planeLinkPercent
-        val planeBatteryPercent = state.planeBatteryPercent ?: modemPlaneBatteryPercent
+        val modemTelemetryFresh = hasFreshModemTelemetry()
+        val planeBatteryPercent = state.planeBatteryPercent ?: modemPlaneBatteryPercent.takeIf { modemTelemetryFresh }
         val landingMode = when (state.landingState) {
             0 -> "LIN"
             1 -> "SPR"
             else -> "--"
         }
-        val ztText = when (modemZt) {
+        val ztText = when (modemZt.takeIf { modemTelemetryFresh }) {
             "D" -> "D"
             "R" -> "R"
             else -> "-"
@@ -3299,7 +3365,7 @@ class MainActivity : ComponentActivity() {
             return SafetyBanner(SafetySeverity.CRITICAL, "Mission error code $missionError")
         }
 
-        val planeBattery = state.planeBatteryPercent ?: modemPlaneBatteryPercent
+        val planeBattery = state.planeBatteryPercent ?: modemPlaneBatteryPercent.takeIf { hasFreshModemTelemetry() }
         if (planeBattery != null) {
             if (planeBattery <= LOW_PLANE_BATTERY_CRITICAL_PCT) {
                 return SafetyBanner(SafetySeverity.CRITICAL, "Plane battery critical: $planeBattery%")
@@ -3370,6 +3436,13 @@ class MainActivity : ComponentActivity() {
         return (nowMs - firstFailure) >= MODEM_TELEMETRY_UNAVAILABLE_GRACE_MS
     }
 
+    private fun hasFreshModemTelemetry(nowMs: Long = System.currentTimeMillis()): Boolean {
+        val lastSuccess = modemTelemetryLastSuccessAtMs
+        if (lastSuccess <= 0L) return false
+        val age = (nowMs - lastSuccess).coerceAtLeast(0L)
+        return age <= MODEM_TELEMETRY_STALE_AGE_MS
+    }
+
     private fun markModemTelemetrySuccess(nowMs: Long = System.currentTimeMillis()) {
         modemTelemetryLastSuccessAtMs = nowMs
         modemTelemetryFirstFailureAtMs = 0L
@@ -3382,9 +3455,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun pollModemTelemetryOnce() {
-        val host = withContext(Dispatchers.Main) {
-            etDiscoIp.text?.toString()?.trim().orEmpty()
-        }
+        val host = readConfigFromPrefs()?.discoIp ?: readConfigFromInputs()?.discoIp.orEmpty()
         if (host.isBlank()) return
 
         val connection = (URL("http://$host:$MODEM_TELEMETRY_PORT$MODEM_TELEMETRY_PATH").openConnection() as? HttpURLConnection)
@@ -3415,11 +3486,17 @@ class MainActivity : ComponentActivity() {
             markModemTelemetrySuccess()
 
             withContext(Dispatchers.Main) {
-                renderInfo(FlightSessionStore.state.value)
+                val current = FlightSessionStore.state.value
+                renderInfo(current)
+                updateSafetyBanner(current)
             }
         } catch (_: Exception) {
             markModemTelemetryFailure()
-            // Keep the previous values when endpoint is temporarily unavailable.
+            withContext(Dispatchers.Main) {
+                val current = FlightSessionStore.state.value
+                renderInfo(current)
+                updateSafetyBanner(current)
+            }
         } finally {
             connection.disconnect()
         }
@@ -3504,7 +3581,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun autoStartEngine() {
-        queueFlightSettingsApply(readFlightSettingsFromInputs() ?: readFlightSettingsFromPrefs())
+        val settingsResult = parseFlightSettingsInputs()
+        val settings = settingsResult.value ?: run {
+            showStatusToast(settingsResult.error ?: "invalid flight settings")
+            return
+        }
+        queueFlightSettingsApply(settings)
         val state = FlightSessionStore.state.value
         if (state.engineRunning) {
             sendSimpleAction(FlightEngineService.ACTION_VIDEO_ON)
@@ -3512,11 +3594,12 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val config = readConfigFromInputs() ?: run {
-            showStatusToast("missing config")
+        val configResult = parseConfigInputs()
+        val config = configResult.value ?: run {
+            showStatusToast(configResult.error ?: "invalid config")
             return
         }
-        resetPilotHomeReference()
+        resetModemTelemetryState()
         saveConfig(config)
         startForegroundService(config)
         sendArmState(false)
@@ -3531,7 +3614,7 @@ class MainActivity : ComponentActivity() {
                 showStatusToast("Reconnecting engine...")
                 val wasRunning = FlightSessionStore.state.value.engineRunning
                 if (wasRunning) {
-                    autoStopEngine()
+                    autoStopEngine(clearSessionState = false)
                     delay(450)
                 }
                 autoStartEngine()
@@ -3548,12 +3631,16 @@ class MainActivity : ComponentActivity() {
         updateConnectionPhaseUi(FlightSessionStore.state.value)
     }
 
-    private fun autoStopEngine() {
+    private fun autoStopEngine(clearSessionState: Boolean = true) {
         centerSticks()
         sendSticks(force = true)
         sendSimpleAction(FlightEngineService.ACTION_VIDEO_OFF)
-        sendSimpleAction(FlightEngineService.ACTION_STOP)
-        resetPilotHomeReference()
+        startService(
+            Intent(this, FlightEngineService::class.java)
+                .setAction(FlightEngineService.ACTION_STOP)
+                .putExtra(FlightEngineService.EXTRA_CLEAR_SESSION_STATE, clearSessionState),
+        )
+        resetModemTelemetryState()
     }
 
     private fun onFirstVideoFrameDecoded() {
@@ -3580,7 +3667,7 @@ class MainActivity : ComponentActivity() {
         if (videoReceiver.isRunning()) return
         val surface = previewSurface
         if (!surfaceAvailable || surface == null || !surface.isValid) return
-        val videoPort = etStreamVideoPort.text.toString().toIntOrNull() ?: 55004
+        val videoPort = readConfigFromPrefs()?.streamVideoPort ?: readConfigFromInputs()?.streamVideoPort ?: return
         videoReceiver.start(surface, videoPort)
         startVideoBootstrapRecovery()
     }
@@ -3595,78 +3682,54 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun readConfigFromInputs(): FlightConfig? {
-        val ip = etDiscoIp.text.toString().trim()
-        if (ip.isEmpty()) return null
-
-        val discoveryPort = etDiscoveryPort.text.toString().toIntOrNull() ?: 44444
-        val c2dPort = etC2dPort.text.toString().toIntOrNull() ?: 54321
-        val d2cPort = etD2cPort.text.toString().toIntOrNull() ?: 9988
-        val streamVideoPort = etStreamVideoPort.text.toString().toIntOrNull() ?: 55004
-        val streamControlPort = etStreamControlPort.text.toString().toIntOrNull() ?: 55005
-
-        return FlightConfig(
-            discoIp = ip,
-            discoveryPort = discoveryPort,
-            c2dPort = c2dPort,
-            d2cPort = d2cPort,
-            streamVideoPort = streamVideoPort,
-            streamControlPort = streamControlPort,
-        )
+        return parseConfigInputs().value
     }
 
+    private fun parseConfigInputs() = FlightInputParsers.parseConfig(
+        discoIp = etDiscoIp.text.toString(),
+        discoveryPort = etDiscoveryPort.text.toString(),
+        c2dPort = etC2dPort.text.toString(),
+        d2cPort = etD2cPort.text.toString(),
+        streamVideoPort = etStreamVideoPort.text.toString(),
+        streamControlPort = etStreamControlPort.text.toString(),
+    )
+
     private fun readConfigFromPrefs(): FlightConfig? {
-        val ip = prefs.getString(PREF_KEY_DISCO_IP, null)?.trim().orEmpty()
-        if (ip.isEmpty()) return null
-        return FlightConfig(
-            discoIp = ip,
+        val rawConfig = FlightConfig(
+            discoIp = prefs.getString(PREF_KEY_DISCO_IP, null)?.trim().orEmpty(),
             discoveryPort = prefs.getInt(PREF_KEY_DISCOVERY_PORT, 44444),
             c2dPort = prefs.getInt(PREF_KEY_C2D_PORT, 54321),
             d2cPort = prefs.getInt(PREF_KEY_D2C_PORT, 9988),
             streamVideoPort = prefs.getInt(PREF_KEY_STREAM_VIDEO_PORT, 55004),
             streamControlPort = prefs.getInt(PREF_KEY_STREAM_CONTROL_PORT, 55005),
         )
+        return FlightInputParsers.parseConfig(
+            discoIp = rawConfig.discoIp,
+            discoveryPort = rawConfig.discoveryPort.toString(),
+            c2dPort = rawConfig.c2dPort.toString(),
+            d2cPort = rawConfig.d2cPort.toString(),
+            streamVideoPort = rawConfig.streamVideoPort.toString(),
+            streamControlPort = rawConfig.streamControlPort.toString(),
+        ).value
     }
 
     private fun readFlightSettingsFromInputs(): FlightSettings? {
-        val maxAltitude = etMaxAltitude.text.toString().toFloatOrNull() ?: return null
-        val minAltitude = etMinAltitude.text.toString().toFloatOrNull() ?: return null
-        val maxDistance = etMaxDistance.text.toString().toFloatOrNull() ?: return null
-        val rthMinAltitude = etRthMinAltitude.text.toString().toFloatOrNull() ?: return null
-        val rthDelay = etRthDelay.text.toString().toIntOrNull() ?: return null
-        val loiterRadius = etLoiterRadius.text.toString().toIntOrNull() ?: return null
-        val loiterAltitude = etLoiterAltitude.text.toString().toFloatOrNull() ?: return null
-        val geofenceEnabled = swGeofence.isChecked
-
-        if (!maxAltitude.isFinite() || !minAltitude.isFinite() || !maxDistance.isFinite() || !rthMinAltitude.isFinite() || !loiterAltitude.isFinite()) {
-            return null
-        }
-        if (maxAltitude <= 0f || minAltitude < 0f || minAltitude > maxAltitude) {
-            return null
-        }
-        if (maxDistance < 0f || rthMinAltitude < 0f || loiterAltitude < 0f || rthDelay < 0) {
-            return null
-        }
-        if (geofenceEnabled && maxDistance <= 0f) {
-            return null
-        }
-        if (loiterRadius <= 0) {
-            return null
-        }
-
-        return FlightSettings(
-            maxAltitudeMeters = maxAltitude,
-            minAltitudeMeters = minAltitude,
-            maxDistanceMeters = maxDistance,
-            geofenceEnabled = geofenceEnabled,
-            rthMinAltitudeMeters = rthMinAltitude,
-            rthDelaySeconds = rthDelay,
-            loiterRadiusMeters = loiterRadius,
-            loiterAltitudeMeters = loiterAltitude,
-        )
+        return parseFlightSettingsInputs().value
     }
 
+    private fun parseFlightSettingsInputs() = FlightInputParsers.parseFlightSettings(
+        maxAltitude = etMaxAltitude.text.toString(),
+        minAltitude = etMinAltitude.text.toString(),
+        maxDistance = etMaxDistance.text.toString(),
+        geofenceEnabled = swGeofence.isChecked,
+        rthMinAltitude = etRthMinAltitude.text.toString(),
+        rthDelay = etRthDelay.text.toString(),
+        loiterRadius = etLoiterRadius.text.toString(),
+        loiterAltitude = etLoiterAltitude.text.toString(),
+    )
+
     private fun readFlightSettingsFromPrefs(): FlightSettings {
-        return FlightSettings(
+        val rawSettings = FlightSettings(
             maxAltitudeMeters = prefs.getFloat(PREF_KEY_MAX_ALTITUDE_M, DEFAULT_MAX_ALTITUDE_M),
             minAltitudeMeters = prefs.getFloat(PREF_KEY_MIN_ALTITUDE_M, DEFAULT_MIN_ALTITUDE_M),
             maxDistanceMeters = prefs.getFloat(PREF_KEY_MAX_DISTANCE_M, DEFAULT_MAX_DISTANCE_M),
@@ -3676,6 +3739,16 @@ class MainActivity : ComponentActivity() {
             loiterRadiusMeters = prefs.getInt(PREF_KEY_LOITER_RADIUS_M, DEFAULT_LOITER_RADIUS_M),
             loiterAltitudeMeters = prefs.getFloat(PREF_KEY_LOITER_ALTITUDE_M, DEFAULT_LOITER_ALTITUDE_M),
         )
+        return FlightInputParsers.parseFlightSettings(
+            maxAltitude = rawSettings.maxAltitudeMeters.toString(),
+            minAltitude = rawSettings.minAltitudeMeters.toString(),
+            maxDistance = rawSettings.maxDistanceMeters.toString(),
+            geofenceEnabled = rawSettings.geofenceEnabled,
+            rthMinAltitude = rawSettings.rthMinAltitudeMeters.toString(),
+            rthDelay = rawSettings.rthDelaySeconds.toString(),
+            loiterRadius = rawSettings.loiterRadiusMeters.toString(),
+            loiterAltitude = rawSettings.loiterAltitudeMeters.toString(),
+        ).value ?: rawSettings
     }
 
     private fun saveFlightSettings(settings: FlightSettings) {
@@ -3726,6 +3799,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendFlightSettings(settings: FlightSettings) {
+        appendCommandEvent("Settings send ${FlightInputParsers.formatSettingsSummary(settings)}")
         startService(
             Intent(this, FlightEngineService::class.java)
                 .setAction(FlightEngineService.ACTION_APPLY_SETTINGS)
@@ -3895,7 +3969,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startForegroundService(config: FlightConfig) {
-        appendCommandEvent("Engine start ip=${config.discoIp}")
+        appendCommandEvent("Engine start ${FlightInputParsers.formatConfigSummary(config)}")
         val intent = Intent(this, FlightEngineService::class.java)
             .setAction(FlightEngineService.ACTION_START)
             .putExtra(FlightEngineService.EXTRA_DISCO_IP, config.discoIp)
@@ -3972,12 +4046,11 @@ class MainActivity : ComponentActivity() {
             return haversineMeters(phoneLat, phoneLon, latitude, longitude)
         }
 
-        val homeLat = pilotHomeLatitude
-        val homeLon = pilotHomeLongitude
-        if (homeLat == null || homeLon == null) {
-            pilotHomeLatitude = latitude
-            pilotHomeLongitude = longitude
-            return 0.0
+        val state = FlightSessionStore.state.value
+        val homeLat = state.homeLatitude
+        val homeLon = state.homeLongitude
+        if (homeLat == null || homeLon == null || !homeLat.isFinite() || !homeLon.isFinite()) {
+            return null
         }
 
         return haversineMeters(homeLat, homeLon, latitude, longitude)
@@ -4004,9 +4077,12 @@ class MainActivity : ComponentActivity() {
         return String.format(Locale.US, "%.0fm", distanceMeters)
     }
 
-    private fun resetPilotHomeReference() {
-        pilotHomeLatitude = null
-        pilotHomeLongitude = null
+    private fun resetModemTelemetryState() {
+        modemSignalPercent = null
+        modemPlaneBatteryPercent = null
+        modemZt = null
+        modemTelemetryLastSuccessAtMs = 0L
+        modemTelemetryFirstFailureAtMs = 0L
     }
 
     private fun showStatusToast(text: String) {
@@ -4025,18 +4101,55 @@ class MainActivity : ComponentActivity() {
 
     private fun updateTakeoffButtonUi() {
         if (!::btnTakeoffLand.isInitialized) return
-        if (airborne) {
-            btnTakeoffLand.text = "Land"
-            btnTakeoffLand.alpha = 1f
-            return
+        when (currentFlightPhase()) {
+            FlightPhase.USER_TAKEOFF,
+            FlightPhase.MOTOR_RAMPING,
+            -> {
+                btnTakeoffLand.text = "Abort Takeoff"
+                btnTakeoffLand.alpha = 1f
+            }
+
+            FlightPhase.HOVERING,
+            FlightPhase.FLYING,
+            -> {
+                btnTakeoffLand.text = "Land"
+                btnTakeoffLand.alpha = 1f
+            }
+
+            FlightPhase.TAKING_OFF -> {
+                btnTakeoffLand.text = "Takeoff..."
+                btnTakeoffLand.alpha = 0.92f
+            }
+
+            FlightPhase.LANDING -> {
+                btnTakeoffLand.text = "Landing..."
+                btnTakeoffLand.alpha = 0.92f
+            }
+
+            FlightPhase.EMERGENCY,
+            FlightPhase.EMERGENCY_LANDING,
+            -> {
+                btnTakeoffLand.text = "Emergency"
+                btnTakeoffLand.alpha = 0.92f
+            }
+
+            else -> {
+                if (benchLockEnabled) {
+                    btnTakeoffLand.text = "Takeoff (Locked)"
+                    btnTakeoffLand.alpha = 0.92f
+                } else {
+                    btnTakeoffLand.text = "Takeoff"
+                    btnTakeoffLand.alpha = 1f
+                }
+            }
         }
-        if (benchLockEnabled) {
-            btnTakeoffLand.text = "Takeoff (Locked)"
-            btnTakeoffLand.alpha = 0.92f
-        } else {
-            btnTakeoffLand.text = "Takeoff"
-            btnTakeoffLand.alpha = 1f
-        }
+    }
+
+    private fun updateRthButtonUi(state: FlightState = FlightSessionStore.state.value) {
+        if (!::btnRth.isInitialized) return
+        val navigateHomeState = currentNavigateHomeState(state)
+        btnRth.text = if (navigateHomeState.isActive) "RTH Off" else "RTH"
+        btnRth.alpha = if (navigateHomeState == NavigateHomeState.UNAVAILABLE) 0.92f else 1f
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -4129,7 +4242,7 @@ class MainActivity : ComponentActivity() {
         val lat = pilotPhoneLatitude ?: return
         val lon = pilotPhoneLongitude ?: return
         val state = FlightSessionStore.state.value
-        if (!state.engineRunning || !state.discoveryOk) return
+        if (!state.engineRunning || !state.discoveryOk || !state.transportReady) return
 
         val now = System.currentTimeMillis()
         if (!force && now - lastControllerGpsSentAtMs < CONTROLLER_GPS_MIN_SEND_INTERVAL_MS) return
@@ -4165,7 +4278,6 @@ class MainActivity : ComponentActivity() {
         }
         saveMissionDraft()
         saveMissionViewport()
-        resetPilotHomeReference()
         if (::videoReceiver.isInitialized) {
             videoReceiver.destroy()
         }

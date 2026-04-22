@@ -64,6 +64,7 @@ class FlightEngineService : Service() {
         const val EXTRA_D2C_PORT = "extra.d2c_port"
         const val EXTRA_STREAM_VIDEO_PORT = "extra.stream_video_port"
         const val EXTRA_STREAM_CONTROL_PORT = "extra.stream_control_port"
+        const val EXTRA_CLEAR_SESSION_STATE = "extra.clear_session_state"
 
         const val EXTRA_PITCH = "extra.pitch"
         const val EXTRA_ROLL = "extra.roll"
@@ -97,6 +98,9 @@ class FlightEngineService : Service() {
         private const val KEY_D2C_PORT = "d2c_port"
         private const val KEY_STREAM_VIDEO_PORT = "stream_video_port"
         private const val KEY_STREAM_CONTROL_PORT = "stream_control_port"
+        private const val KEY_HOME_LATITUDE = "home_latitude"
+        private const val KEY_HOME_LONGITUDE = "home_longitude"
+        private const val KEY_HOME_ALTITUDE_METERS = "home_altitude_m"
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -148,15 +152,10 @@ class FlightEngineService : Service() {
         val error: String? = null,
     )
 
-    private data class FlightSettingsCommand(
-        val maxAltitudeMeters: Float,
-        val minAltitudeMeters: Float,
-        val maxDistanceMeters: Float,
-        val geofenceEnabled: Boolean,
-        val rthMinAltitudeMeters: Float,
-        val rthDelaySeconds: Int,
-        val loiterRadiusMeters: Int,
-        val loiterAltitudeMeters: Float,
+    private data class HomeReference(
+        val latitude: Double,
+        val longitude: Double,
+        val altitudeMeters: Float,
     )
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -167,7 +166,7 @@ class FlightEngineService : Service() {
             return START_STICKY
         }
 
-        when (intent?.action) {
+        when (intent.action) {
             ACTION_START -> {
                 val config = parseConfig(intent) ?: run {
                     updateStatus("invalid config")
@@ -178,7 +177,8 @@ class FlightEngineService : Service() {
             }
 
             ACTION_STOP -> {
-                stopEngine("stopped by user")
+                val clearSessionState = intent.getBooleanExtra(EXTRA_CLEAR_SESSION_STATE, true)
+                stopEngine("stopped by user", clearResumeFlag = clearSessionState)
                 stopSelf()
             }
             ACTION_SET_STICKS -> {
@@ -266,7 +266,7 @@ class FlightEngineService : Service() {
         )
     }
 
-    private fun parseFlightSettings(intent: Intent): FlightSettingsCommand? {
+    private fun parseFlightSettings(intent: Intent): FlightSettings? {
         val maxAltitude = intent.getFloatExtra(EXTRA_MAX_ALTITUDE_METERS, Float.NaN)
         val minAltitude = intent.getFloatExtra(EXTRA_MIN_ALTITUDE_METERS, Float.NaN)
         val maxDistance = intent.getFloatExtra(EXTRA_MAX_DISTANCE_METERS, Float.NaN)
@@ -289,7 +289,7 @@ class FlightEngineService : Service() {
             return null
         }
 
-        return FlightSettingsCommand(
+        return FlightSettings(
             maxAltitudeMeters = maxAltitude,
             minAltitudeMeters = minAltitude,
             maxDistanceMeters = maxDistance,
@@ -308,6 +308,7 @@ class FlightEngineService : Service() {
         }
 
         persistEngineConfig(config, resume = true)
+        val savedHome = readSavedHomeReference()
         runningConfig = config
         pitch = 0
         roll = 0
@@ -318,11 +319,15 @@ class FlightEngineService : Service() {
             it.copy(
                 engineRunning = true,
                 discoveryOk = false,
+                transportReady = false,
                 controlsArmed = controlsArmed,
                 planeLinkPercent = 0,
                 groundSpeedMps = 0f,
                 txPackets = 0,
                 rxPackets = 0,
+                homeLatitude = savedHome?.latitude,
+                homeLongitude = savedHome?.longitude,
+                homeAltitudeMeters = savedHome?.altitudeMeters,
                 message = "starting engine",
             )
         }
@@ -347,8 +352,12 @@ class FlightEngineService : Service() {
                         it.copy(
                             engineRunning = false,
                             discoveryOk = false,
+                            transportReady = false,
                             controlsArmed = controlsArmed,
                             planeLinkPercent = 0,
+                            homeLatitude = savedHome?.latitude,
+                            homeLongitude = savedHome?.longitude,
+                            homeAltitudeMeters = savedHome?.altitudeMeters,
                             message = discoveryMessage,
                         )
                     }
@@ -360,6 +369,7 @@ class FlightEngineService : Service() {
                 FlightSessionStore.update {
                     it.copy(
                         discoveryOk = true,
+                        transportReady = isTransportReady(),
                         controlsArmed = controlsArmed,
                         message = "discovery ok",
                     )
@@ -385,8 +395,13 @@ class FlightEngineService : Service() {
                 FlightSessionStore.update {
                     it.copy(
                         engineRunning = false,
+                        discoveryOk = false,
+                        transportReady = false,
                         controlsArmed = controlsArmed,
                         planeLinkPercent = 0,
+                        homeLatitude = savedHome?.latitude,
+                        homeLongitude = savedHome?.longitude,
+                        homeAltitudeMeters = savedHome?.altitudeMeters,
                         message = "engine error: ${e.message ?: e::class.java.simpleName}",
                     )
                 }
@@ -418,6 +433,7 @@ class FlightEngineService : Service() {
         lastAnyRxAtMs = 0L
         if (clearResumeFlag) {
             servicePrefs.edit().putBoolean(KEY_RESUME_ENGINE, false).apply()
+            persistHomeReference(null)
         }
 
         FlightSessionStore.reset(reason)
@@ -511,7 +527,14 @@ class FlightEngineService : Service() {
         reconnectAttempt += 1
         lastReconnectAtMs = System.currentTimeMillis()
 
-        updateStatus("reconnect #$reconnectAttempt: $reason")
+        FlightSessionStore.update {
+            it.copy(
+                discoveryOk = false,
+                transportReady = false,
+                message = "reconnect #$reconnectAttempt: $reason",
+            )
+        }
+        refreshNotification("reconnect #$reconnectAttempt")
         val result = reconnectTransport(config)
         if (result.ok) {
             lastAnyRxAtMs = System.currentTimeMillis()
@@ -519,6 +542,7 @@ class FlightEngineService : Service() {
             FlightSessionStore.update {
                 it.copy(
                     discoveryOk = true,
+                    transportReady = isTransportReady(),
                     planeLinkPercent = 100,
                     message = "reconnected",
                 )
@@ -531,6 +555,7 @@ class FlightEngineService : Service() {
             FlightSessionStore.update {
                 it.copy(
                     discoveryOk = false,
+                    transportReady = false,
                     planeLinkPercent = 0,
                     message = failure,
                 )
@@ -679,6 +704,18 @@ class FlightEngineService : Service() {
                 }
             }
 
+            project == 1 && commandClass == 4 && commandId == 3 && payload.size >= 12 -> {
+                val state = ByteBuffer.wrap(payload, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                val reason = ByteBuffer.wrap(payload, 8, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                FlightSessionStore.update {
+                    it.copy(
+                        navigateHomeState = state,
+                        navigateHomeReason = reason,
+                        lastTelemetryAtMs = now,
+                    )
+                }
+            }
+
             // ARDRONE3 PilotingState.LandingStateChanged (0=linear, 1=spiral)
             project == 1 && commandClass == 4 && commandId == 10 && payload.size >= 8 -> {
                 val state = ByteBuffer.wrap(payload, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
@@ -727,48 +764,88 @@ class FlightEngineService : Service() {
 
     private fun sendTakeoff() {
         val config = requireCriticalCommandConfig("takeoff") ?: return
+        val phase = FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState)
+        if (!phase.allowsTakeoffStart) {
+            updateStatus("takeoff blocked: aircraft is ${phase.label}")
+            return
+        }
         if (!controlsArmed) {
             updateStatus("takeoff blocked: arm controls first")
             return
         }
-        val homeSet = setHomeFromCurrentPosition(config)
-        sendUserTakeOff(config, enabled = true)
-        updateStatus(if (homeSet) "takeoff command sent (home set)" else "takeoff command sent (home unchanged)")
+        val home = setHomeFromCurrentPosition(config)
+        if (!sendUserTakeOff(config, enabled = true)) {
+            return
+        }
+        if (home != null) {
+            persistHomeReference(home)
+        }
+        updateStatus(if (home != null) "takeoff command sent (home set)" else "takeoff command sent (home unchanged)")
     }
 
-    private fun sendUserTakeOff(config: FlightConfig, enabled: Boolean) {
-        sendSimpleCommand(
+    private fun sendUserTakeOff(config: FlightConfig, enabled: Boolean): Boolean {
+        return sendSimpleCommand(
             config = config,
             project = 1,
             commandClass = 0,
             commandId = 8,
             args = byteArrayOf(if (enabled) 1 else 0),
+            label = if (enabled) "takeoff" else "takeoff abort",
         )
     }
 
     private fun sendLand() {
-        val config = requireRunningConfig("land") ?: return
-        val flightState = FlightSessionStore.state.value.flyingState ?: 0
-        if (flightState == 0) {
-            sendUserTakeOff(config, enabled = false)
-            updateStatus("takeoff cancel sent")
-            return
+        val config = requireCriticalCommandConfig("land") ?: return
+        when (FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState)) {
+            FlightPhase.USER_TAKEOFF,
+            FlightPhase.MOTOR_RAMPING,
+            -> {
+                if (!sendUserTakeOff(config, enabled = false)) {
+                    return
+                }
+                updateStatus("takeoff cancel sent")
+            }
+
+            FlightPhase.HOVERING,
+            FlightPhase.FLYING,
+            -> {
+                if (!sendSimpleCommand(config, project = 1, commandClass = 0, commandId = 3, label = "land")) {
+                    return
+                }
+                updateStatus("land command sent")
+            }
+
+            else -> {
+                updateStatus("land blocked: aircraft is ${FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState).label}")
+            }
         }
-        sendSimpleCommand(config, project = 1, commandClass = 0, commandId = 3)
-        updateStatus("land command sent")
     }
 
     private fun sendNavigateHome(start: Boolean) {
         val config = requireCriticalCommandConfig(if (start) "rth start" else "rth stop") ?: return
-        sendSimpleCommand(config, project = 1, commandClass = 0, commandId = 5, args = byteArrayOf(if (start) 1 else 0))
+        if (start && !FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState).allowsNavigateHomeStart) {
+            updateStatus("rth start blocked: aircraft is ${FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState).label}")
+            return
+        }
+        if (!sendSimpleCommand(
+                config,
+                project = 1,
+                commandClass = 0,
+                commandId = 5,
+                args = byteArrayOf(if (start) 1 else 0),
+                label = if (start) "rth start" else "rth stop",
+            )
+        ) {
+            return
+        }
         updateStatus(if (start) "rth start sent" else "rth stop sent")
     }
 
     private fun sendMavlinkStart(filePath: String, type: Int) {
         val config = requireCriticalCommandConfig("mavlink start") ?: return
-        val flightState = FlightSessionStore.state.value.flyingState ?: 0
-        if (flightState == 0) {
-            updateStatus("mavlink start blocked: aircraft not airborne")
+        val phase = FlightPhase.fromArsdk(FlightSessionStore.state.value.flyingState)
+        if (!phase.allowsMissionStart) {
+            updateStatus("mavlink start blocked: aircraft is ${phase.label}")
             return
         }
         val normalizedPath = filePath.trim()
@@ -778,19 +855,25 @@ class FlightEngineService : Service() {
             put(0)
             putInt(type)
         }.array()
-        sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 0, args = args)
+        if (!sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 0, args = args, label = "mavlink start")) {
+            return
+        }
         updateStatus("mavlink start sent: $normalizedPath")
     }
 
     private fun sendMavlinkPause() {
         val config = requireCriticalCommandConfig("mavlink pause") ?: return
-        sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 1)
+        if (!sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 1, label = "mavlink pause")) {
+            return
+        }
         updateStatus("mavlink pause sent")
     }
 
     private fun sendMavlinkStop() {
-        val config = requireRunningConfig("mavlink stop") ?: return
-        sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 2)
+        val config = requireCriticalCommandConfig("mavlink stop") ?: return
+        if (!sendSimpleCommand(config, project = 0, commandClass = 11, commandId = 2, label = "mavlink stop")) {
+            return
+        }
         updateStatus("mavlink stop sent")
     }
 
@@ -812,86 +895,104 @@ class FlightEngineService : Service() {
         sendPayloadWithAck(config, payload)
     }
 
-    private fun setHomeFromCurrentPosition(config: FlightConfig): Boolean {
+    private fun setHomeFromCurrentPosition(config: FlightConfig): HomeReference? {
         val state = FlightSessionStore.state.value
         val lat = state.latitude
         val lon = state.longitude
-        if (lat == null || lon == null || !lat.isFinite() || !lon.isFinite()) return false
-        if (lat == 0.0 && lon == 0.0) return false
+        if (lat == null || lon == null || !lat.isFinite() || !lon.isFinite()) return null
+        if (lat == 0.0 && lon == 0.0) return null
 
-        val altitude = (state.altitudeMeters ?: 0f).toDouble()
+        val altitudeMeters = state.altitudeMeters ?: 0f
+        val altitude = altitudeMeters.toDouble()
         val setHomeArgs = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN).apply {
             putDouble(lat)
             putDouble(lon)
             putDouble(altitude)
         }.array()
-        sendSimpleCommand(config, project = 1, commandClass = 23, commandId = 0, args = setHomeArgs)
-        sendSimpleCommand(config, project = 1, commandClass = 23, commandId = 3, args = byteArrayOf(0))
-        return true
+        if (!sendSimpleCommand(config, project = 1, commandClass = 23, commandId = 0, args = setHomeArgs, label = "set home")) {
+            return null
+        }
+        if (!sendSimpleCommand(config, project = 1, commandClass = 23, commandId = 3, args = byteArrayOf(0), label = "home type")) {
+            return null
+        }
+        return HomeReference(latitude = lat, longitude = lon, altitudeMeters = altitudeMeters)
     }
 
-    private fun applyFlightSettings(settings: FlightSettingsCommand) {
-        val config = requireRunningConfig("apply settings") ?: return
+    private fun applyFlightSettings(settings: FlightSettings) {
+        val config = requireCriticalCommandConfig("apply settings") ?: return
 
-        sendSimpleCommand(
+        val applied =
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 2,
             commandId = 0,
             args = encodeFloat(settings.maxAltitudeMeters),
-        )
-        sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 2,
             commandId = 11,
             args = encodeFloat(settings.minAltitudeMeters),
-        )
-        if (settings.maxDistanceMeters > 0f) {
-            sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            (
+                settings.maxDistanceMeters <= 0f ||
+                    sendSimpleCommand(
                 config,
                 project = 1,
                 commandClass = 2,
                 commandId = 3,
                 args = encodeFloat(settings.maxDistanceMeters),
+                label = "apply settings",
             )
-        }
-        sendSimpleCommand(
+            ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 2,
             commandId = 4,
             args = byteArrayOf(if (settings.geofenceEnabled) 1 else 0),
-        )
-        sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 2,
             commandId = 13,
             args = encodeU16(settings.loiterRadiusMeters),
-        )
-        sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 2,
             commandId = 14,
             args = encodeU16(settings.loiterAltitudeMeters.toInt()),
-        )
-        sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 23,
             commandId = 5,
             args = encodeFloat(settings.rthMinAltitudeMeters),
-        )
-        sendSimpleCommand(
+            label = "apply settings",
+        ) &&
+            sendSimpleCommand(
             config,
             project = 1,
             commandClass = 23,
             commandId = 4,
             args = encodeU16(settings.rthDelaySeconds),
+            label = "apply settings",
         )
-        updateStatus("flight settings applied")
+        if (!applied) {
+            return
+        }
+        updateStatus("flight settings applied: ${FlightInputParsers.formatSettingsSummary(settings)}")
     }
 
     private fun encodeFloat(value: Float): ByteArray =
@@ -905,22 +1006,28 @@ class FlightEngineService : Service() {
         if (enabled) {
             // Request high reliability stream mode (enum 1) before enabling.
             val reliabilityMode = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array()
-            sendSimpleCommand(
+            if (!sendSimpleCommand(
                 config,
                 project = 1,
                 commandClass = 21,
                 commandId = 1,
                 args = reliabilityMode,
-            )
+                label = "video reliability",
+            )) {
+                return
+            }
         }
         try {
-            sendSimpleCommand(
+            if (!sendSimpleCommand(
                 config,
                 project = 1,
                 commandClass = 21,
                 commandId = 0,
                 args = byteArrayOf(if (enabled) 1 else 0),
-            )
+                label = if (enabled) "video on" else "video off",
+            )) {
+                return
+            }
         } catch (e: Exception) {
             if (!enabled && isSocketClosedError(e)) {
                 // Shutdown races can close sockets before VIDEO_OFF; this is harmless.
@@ -948,34 +1055,35 @@ class FlightEngineService : Service() {
         commandClass: Int,
         commandId: Int,
         args: ByteArray = byteArrayOf(),
-    ) {
+        label: String? = null,
+    ): Boolean {
         val payload = ArCommandEncoder.encodeSimpleCommand(
             project = project,
             commandClass = commandClass,
             commandId = commandId,
             args = args,
         )
-        sendPayload(config, payload)
+        return sendPayload(config, payload, label)
     }
 
-    private fun sendPayload(config: FlightConfig, payload: ByteArray) {
+    private fun sendPayload(config: FlightConfig, payload: ByteArray, label: String? = null): Boolean {
         val frame = ArNetwork.generateFrame(
             payload = payload,
             sequencer = sequencer,
             type = ArNetwork.FRAME_TYPE_DATA,
             id = ArNetwork.BD_NET_CD_NONACK_ID,
         )
-        sendDatagram(config, frame)
+        return sendDatagram(config, frame, label)
     }
 
-    private fun sendPayloadWithAck(config: FlightConfig, payload: ByteArray) {
+    private fun sendPayloadWithAck(config: FlightConfig, payload: ByteArray, label: String? = null): Boolean {
         val frame = ArNetwork.generateFrame(
             payload = payload,
             sequencer = sequencer,
             type = ArNetwork.FRAME_TYPE_DATA_WITH_ACK,
             id = ArNetwork.BD_NET_CD_ACK_ID,
         )
-        sendDatagram(config, frame)
+        return sendDatagram(config, frame, label)
     }
 
     private fun sendAck(config: FlightConfig, incomingId: Int, incomingSeq: Int) {
@@ -999,12 +1107,23 @@ class FlightEngineService : Service() {
         sendDatagram(config, frame)
     }
 
-    private fun sendDatagram(config: FlightConfig, bytes: ByteArray) {
-        val socket = txSocket ?: return
-        val address = targetAddress ?: return
+    private fun sendDatagram(config: FlightConfig, bytes: ByteArray, label: String? = null): Boolean {
+        val socket = txSocket ?: return markSendFailure(label, "transport socket unavailable")
+        val address = targetAddress ?: return markSendFailure(label, "target address unavailable")
         val packet = DatagramPacket(bytes, bytes.size, address, config.c2dPort)
-        socket.send(packet)
-        FlightSessionStore.update { it.copy(txPackets = it.txPackets + 1) }
+        return try {
+            socket.send(packet)
+            FlightSessionStore.update {
+                it.copy(
+                    txPackets = it.txPackets + 1,
+                    transportReady = isTransportReady(),
+                )
+            }
+            true
+        } catch (e: IOException) {
+            FlightSessionStore.update { it.copy(transportReady = false) }
+            markSendFailure(label, e.message ?: e::class.java.simpleName)
+        }
     }
 
     private suspend fun reconnectTransport(config: FlightConfig): DiscoveryResult {
@@ -1077,6 +1196,8 @@ class FlightEngineService : Service() {
 
     private fun clampAxis(value: Int): Int = value.coerceIn(-100, 100)
 
+    private fun isTransportReady(): Boolean = txSocket != null && targetAddress != null
+
     private fun computePlaneLinkPercent(nowMs: Long): Int {
         if (lastAnyRxAtMs <= 0L) return 0
         val age = nowMs - lastAnyRxAtMs
@@ -1110,7 +1231,18 @@ class FlightEngineService : Service() {
             updateStatus("$action blocked: discovery not ready")
             return null
         }
+        if (!state.transportReady || !isTransportReady()) {
+            updateStatus("$action blocked: transport not ready")
+            return null
+        }
         return config
+    }
+
+    private fun markSendFailure(label: String?, reason: String): Boolean {
+        if (label != null) {
+            updateStatus("$label failed: $reason")
+        }
+        return false
     }
 
     private fun safeAction(label: String, action: () -> Unit) {
@@ -1152,6 +1284,45 @@ class FlightEngineService : Service() {
             .putInt(KEY_STREAM_VIDEO_PORT, config.streamVideoPort)
             .putInt(KEY_STREAM_CONTROL_PORT, config.streamControlPort)
             .apply()
+    }
+
+    private fun persistHomeReference(home: HomeReference?) {
+        servicePrefs.edit().apply {
+            if (home == null) {
+                remove(KEY_HOME_LATITUDE)
+                remove(KEY_HOME_LONGITUDE)
+                remove(KEY_HOME_ALTITUDE_METERS)
+            } else {
+                putLong(KEY_HOME_LATITUDE, java.lang.Double.doubleToRawLongBits(home.latitude))
+                putLong(KEY_HOME_LONGITUDE, java.lang.Double.doubleToRawLongBits(home.longitude))
+                putFloat(KEY_HOME_ALTITUDE_METERS, home.altitudeMeters)
+            }
+        }.apply()
+
+        FlightSessionStore.update {
+            it.copy(
+                homeLatitude = home?.latitude,
+                homeLongitude = home?.longitude,
+                homeAltitudeMeters = home?.altitudeMeters,
+            )
+        }
+    }
+
+    private fun readSavedHomeReference(): HomeReference? {
+        if (!servicePrefs.contains(KEY_HOME_LATITUDE) || !servicePrefs.contains(KEY_HOME_LONGITUDE)) {
+            return null
+        }
+        val latitude = java.lang.Double.longBitsToDouble(servicePrefs.getLong(KEY_HOME_LATITUDE, 0L))
+        val longitude = java.lang.Double.longBitsToDouble(servicePrefs.getLong(KEY_HOME_LONGITUDE, 0L))
+        val altitudeMeters = servicePrefs.getFloat(KEY_HOME_ALTITUDE_METERS, 0f)
+        if (!latitude.isFinite() || !longitude.isFinite()) {
+            return null
+        }
+        return HomeReference(
+            latitude = latitude,
+            longitude = longitude,
+            altitudeMeters = altitudeMeters,
+        )
     }
 
     private fun readSavedConfig(): FlightConfig? {
