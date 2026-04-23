@@ -63,6 +63,18 @@ class RtpH264VideoReceiver(
     @Volatile
     private var running = false
 
+    @Volatile
+    private var decoderReady = false
+
+    @Volatile
+    private var lastRtpPacketAtMs = 0L
+
+    @Volatile
+    private var lastFrameDecodedAtMs = 0L
+
+    @Volatile
+    private var lastError: String? = null
+
     private data class PendingPacket(
         val sequence: Int,
         val bytes: ByteArray,
@@ -72,15 +84,32 @@ class RtpH264VideoReceiver(
 
     fun isRunning(): Boolean = running
 
-    fun start(surface: Surface, port: Int, width: Int = 856, height: Int = 480) {
+    fun snapshot(): VideoReceiverSnapshot {
+        return VideoReceiverSnapshot(
+            running = running,
+            decoderReady = decoderReady,
+            lastRtpPacketAtMs = lastRtpPacketAtMs,
+            lastFrameDecodedAtMs = lastFrameDecodedAtMs,
+            lastError = lastError,
+            decodedFrames = decodedFrames,
+        )
+    }
+
+    fun start(surface: Surface, port: Int, width: Int = 856, height: Int = 480): Boolean {
         stopReceiver()
+        decoderReady = false
+        lastRtpPacketAtMs = 0L
+        lastFrameDecodedAtMs = 0L
+        lastError = null
 
         try {
             configureCodec(surface, width, height)
         } catch (e: Exception) {
-            onStatus("decoder init failed: ${e.message ?: e::class.java.simpleName}")
+            val error = "decoder init failed: ${e.message ?: e::class.java.simpleName}"
+            lastError = error
+            onStatus(error)
             releaseCodec()
-            return
+            return false
         }
 
         running = true
@@ -122,6 +151,7 @@ class RtpH264VideoReceiver(
                     try {
                         val packet = DatagramPacket(packetBuffer, packetBuffer.size)
                         socket?.receive(packet)
+                        lastRtpPacketAtMs = System.currentTimeMillis()
                         rtpPackets++
                         enqueuePendingPacket(packet.data, packet.length)
                         drainPendingPackets(force = false)
@@ -132,20 +162,25 @@ class RtpH264VideoReceiver(
                         maybeUpdateProgress()
                     } catch (e: Exception) {
                         if (!running || !isActive) break
-                        onStatus("video rx error: ${e.message ?: e::class.java.simpleName}")
+                        val error = "video rx error: ${e.message ?: e::class.java.simpleName}"
+                        lastError = error
+                        onStatus(error)
                     }
                     drainDecoder()
                 }
             } catch (e: Exception) {
                 if (running) {
                     Log.e(TAG, "receiver failed", e)
-            onStatus("video receiver failed: ${e.message ?: e::class.java.simpleName}")
+                    val error = "video receiver failed: ${e.message ?: e::class.java.simpleName}"
+                    lastError = error
+                    onStatus(error)
                 }
             } finally {
                 drainPendingPackets(force = true)
                 cleanup()
             }
         }
+        return true
     }
 
     fun stop() {
@@ -183,6 +218,7 @@ class RtpH264VideoReceiver(
             configure(format, surface, null, 0)
             start()
         }
+        decoderReady = true
         Log.i(TAG, "decoder ready ${width}x$height")
         onStatus("decoder ready")
     }
@@ -554,6 +590,7 @@ class RtpH264VideoReceiver(
                 onFirstFrameDecoded?.invoke()
             }
             decodedFrames++
+            lastFrameDecodedAtMs = System.currentTimeMillis()
             outIndex = mediaCodec.dequeueOutputBuffer(info, 0)
             maybeUpdateProgress()
         }
@@ -583,6 +620,9 @@ class RtpH264VideoReceiver(
         pendingPackets.clear()
         lastGapSize = 0
         firstFrameNotified = false
+        decoderReady = false
+        lastRtpPacketAtMs = 0L
+        lastFrameDecodedAtMs = 0L
         releaseCodec()
         running = false
         Log.i(TAG, "receiver cleaned up")

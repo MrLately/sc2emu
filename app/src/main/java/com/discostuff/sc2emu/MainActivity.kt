@@ -61,13 +61,20 @@ import com.discostuff.sc2emu.controls.VirtualStickView
 import com.discostuff.sc2emu.flight.FlightConfig
 import com.discostuff.sc2emu.flight.FlightEngineService
 import com.discostuff.sc2emu.flight.FlightInputParsers
+import com.discostuff.sc2emu.flight.FlightMapEvaluator
+import com.discostuff.sc2emu.flight.FlightMapModel
 import com.discostuff.sc2emu.flight.FlightPhase
+import com.discostuff.sc2emu.flight.FlightPersistenceSanitizer
 import com.discostuff.sc2emu.flight.FlightSettings
 import com.discostuff.sc2emu.flight.FlightSessionStore
 import com.discostuff.sc2emu.flight.FlightState
 import com.discostuff.sc2emu.flight.NavigateHomeState
 import com.discostuff.sc2emu.mission.MissionMavlinkBuilder
 import com.discostuff.sc2emu.video.RtpH264VideoReceiver
+import com.discostuff.sc2emu.video.VideoFeedEvaluator
+import com.discostuff.sc2emu.video.VideoFeedModel
+import com.discostuff.sc2emu.video.VideoFeedState
+import com.discostuff.sc2emu.video.VideoReceiverSnapshot
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -190,6 +197,12 @@ class MainActivity : ComponentActivity() {
         private const val VIDEO_BOOTSTRAP_INITIAL_DELAY_MS = 450L
         private const val VIDEO_BOOTSTRAP_RETRY_DELAY_MS = 1_800L
         private const val VIDEO_BOOTSTRAP_MAX_RETRIES = 2
+        private const val VIDEO_START_TIMEOUT_MS = 8_000L
+        private const val VIDEO_STALE_FRAME_MS = 5_500L
+        private const val VIDEO_STALE_PACKET_MS = 8_000L
+        private const val VIDEO_RECOVERY_COOLDOWN_MS = 3_000L
+        private const val VIDEO_MAX_RECOVERY_ATTEMPTS = 3
+        private const val VIDEO_RECOVERY_RESET_AFTER_LIVE_MS = 12_000L
         private const val FLIGHT_MAP_UPDATE_INTERVAL_MS = 350L
         private const val FLIGHT_MAP_TRAIL_MAX_POINTS = 64
         private const val FLIGHT_MAP_TRAIL_MIN_STEP_M = 3.0
@@ -359,9 +372,11 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var videoStreamContainer: FrameLayout
     private lateinit var textureVideo: TextureView
-    private lateinit var tvMiniVideoStatus: TextView
+    private lateinit var videoStatusScrim: View
+    private lateinit var tvVideoStatusOverlay: TextView
     private lateinit var mapFlightContainer: FrameLayout
     private lateinit var mapFlight: MapView
+    private lateinit var tvMapStatusOverlay: TextView
     private lateinit var stickLeft: VirtualStickView
     private lateinit var stickRight: VirtualStickView
     private lateinit var attitudeIndicatorContainer: View
@@ -399,7 +414,13 @@ class MainActivity : ComponentActivity() {
     private var surfaceAvailable = false
     private var previewSurface: Surface? = null
     private var videoBootstrapJob: Job? = null
-    private var waitingForFirstVideoFrame = false
+    private var videoBootstrapActive = false
+    private var videoBootstrapStartedAtMs: Long = 0L
+    private var videoRecoveryAttempts = 0
+    private var lastVideoRecoveryAttemptAtMs: Long = 0L
+    private var videoRecoveryExhaustedLogged = false
+    private var videoLiveStableSinceAtMs: Long = 0L
+    private var lastLoggedVideoFeedState: VideoFeedState? = null
 
     private var configVisible = false
     private var missionVisible = false
@@ -620,9 +641,11 @@ class MainActivity : ComponentActivity() {
 
         videoStreamContainer = findViewById(R.id.videoStreamContainer)
         textureVideo = findViewById(R.id.textureVideo)
-        tvMiniVideoStatus = findViewById(R.id.tvMiniVideoStatus)
+        videoStatusScrim = findViewById(R.id.videoStatusScrim)
+        tvVideoStatusOverlay = findViewById(R.id.tvVideoStatusOverlay)
         mapFlightContainer = findViewById(R.id.mapFlightContainer)
         mapFlight = findViewById(R.id.mapFlight)
+        tvMapStatusOverlay = findViewById(R.id.tvMapStatusOverlay)
         stickLeft = findViewById(R.id.stickLeft)
         stickRight = findViewById(R.id.stickRight)
         attitudeIndicatorContainer = findViewById(R.id.attitudeIndicatorContainer)
@@ -920,6 +943,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     val current = FlightSessionStore.state.value
                     renderInfo(current)
+                    updateVideoStatusUi(current)
                 }
             },
             onFirstFrameDecoded = {
@@ -935,7 +959,7 @@ class MainActivity : ComponentActivity() {
                 previewSurface?.release()
                 previewSurface = Surface(surface)
                 applyVideoAspectTransform(width, height)
-                startVideoReceiverIfPossible()
+                startVideoReceiverIfPossible(FlightSessionStore.state.value)
             }
 
             override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
@@ -2892,14 +2916,17 @@ class MainActivity : ComponentActivity() {
                     if (state.engineRunning && state.discoveryOk) {
                         applyPendingFlightSettingsIfReady()
                         sendControllerGpsToPlaneIfReady()
-                        startVideoReceiverIfPossible()
+                    }
+
+                    if (shouldMaintainVideoSession(state)) {
+                        startVideoReceiverIfPossible(state)
                     } else {
                         stopVideoReceiver()
                     }
 
                     updateAttitudeIndicator(state)
                     renderInfo(state)
-                    updateMiniVideoStatus(state)
+                    updateVideoStatusUi(state)
                     renderFlightMap(state)
                     updateSafetyBanner(state)
                     updateMissionControlUi()
@@ -3336,36 +3363,22 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun updateMiniVideoStatus(state: FlightState = FlightSessionStore.state.value) {
-        if (!::tvMiniVideoStatus.isInitialized) return
-        if (flightViewMode != FlightViewMode.MAP_FOCUS) {
-            tvMiniVideoStatus.visibility = View.GONE
-            return
+    private fun updateVideoStatusUi(state: FlightState = FlightSessionStore.state.value) {
+        if (!::tvVideoStatusOverlay.isInitialized || !::videoStatusScrim.isInitialized) return
+        val model = currentVideoFeedModel(state)
+        val visible = !model.label.isNullOrBlank()
+
+        if (lastLoggedVideoFeedState != model.state) {
+            appendCommandEvent("Video state: ${model.state.name.lowercase(Locale.US)}")
+            lastLoggedVideoFeedState = model.state
         }
 
-        val videoRunning = ::videoReceiver.isInitialized && videoReceiver.isRunning()
-        val hasLink = state.engineRunning && state.discoveryOk && state.transportReady
-        val waitingFrame = waitingForFirstVideoFrame
+        textureVideo.alpha = if (model.blankVideo) 0f else 1f
+        videoStatusScrim.visibility = if (visible) View.VISIBLE else View.GONE
+        tvVideoStatusOverlay.visibility = if (visible) View.VISIBLE else View.GONE
+        tvVideoStatusOverlay.text = model.label.orEmpty()
 
-        val message = when {
-            !state.engineRunning -> "Engine Off"
-            !state.discoveryOk -> "No Link"
-            !state.transportReady -> "Transport"
-            waitingFrame -> "Waiting Video"
-            !videoRunning -> "No Video"
-            else -> null
-        }
-
-        if (message == null) {
-            tvMiniVideoStatus.visibility = View.GONE
-            return
-        }
-        if (!hasLink && message == "No Video") {
-            tvMiniVideoStatus.text = "No Link"
-        } else {
-            tvMiniVideoStatus.text = message
-        }
-        tvMiniVideoStatus.visibility = View.VISIBLE
+        maybeAttemptVideoRecovery(state, model)
     }
 
     private fun renderFlightMap(state: FlightState, force: Boolean = false) {
@@ -3374,8 +3387,10 @@ class MainActivity : ComponentActivity() {
         if (!force && (now - lastFlightMapUpdateAtMs) < FLIGHT_MAP_UPDATE_INTERVAL_MS) return
         lastFlightMapUpdateAtMs = now
 
-        val planePoint = toValidGeoPoint(state.latitude, state.longitude)
+        val rawPlanePoint = toValidGeoPoint(state.latitude, state.longitude)
         val pilotPoint = toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
+        val mapModel = currentFlightMapModel(state, rawPlanePoint, pilotPoint)
+        val planePoint = rawPlanePoint.takeIf { mapModel.showPlaneMarker }
 
         if (planePoint != null) {
             val marker = flightPlaneMarker ?: Marker(mapFlight).apply {
@@ -3409,13 +3424,18 @@ class MainActivity : ComponentActivity() {
             flightPilotMarker = null
         }
 
-        updateFlightTrail(planePoint)
+        if (mapModel.showFlightTrail) {
+            updateFlightTrail(planePoint)
+        } else {
+            hideFlightTrailOverlay()
+        }
         if (flightViewMode == FlightViewMode.VIDEO_FOCUS) {
             followMiniFlightMap(planePoint ?: pilotPoint)
         }
         if (!flightMapHasCentered) {
             focusFlightMapOnBestKnownPosition(forceZoom = flightViewMode == FlightViewMode.MAP_FOCUS)
         }
+        updateMapStatusUi(mapModel)
         mapFlight.invalidate()
     }
 
@@ -3451,6 +3471,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun hideFlightTrailOverlay() {
+        flightTrackPolyline?.let { mapFlight.overlays.remove(it) }
+    }
+
     private fun followMiniFlightMap(target: GeoPoint?) {
         if (target == null) return
         val last = lastMiniMapFollowPoint
@@ -3462,10 +3486,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun focusFlightMapOnBestKnownPosition(forceZoom: Boolean): Boolean {
-        val state = FlightSessionStore.state.value
-        val target = toValidGeoPoint(state.latitude, state.longitude)
-            ?: toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
-            ?: return false
+        val target = bestKnownFlightMapTarget() ?: return false
         if (forceZoom) {
             mapFlight.controller.setZoom(FLIGHT_MAP_FOCUS_ZOOM)
         }
@@ -3475,10 +3496,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun centerMiniFlightMapOnBestKnownPosition(): Boolean {
-        val state = FlightSessionStore.state.value
-        val target = toValidGeoPoint(state.latitude, state.longitude)
-            ?: toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
-            ?: return false
+        val target = bestKnownFlightMapTarget() ?: return false
         mapFlight.controller.setCenter(target)
         lastMiniMapFollowPoint = target
         return true
@@ -3889,6 +3907,8 @@ class MainActivity : ComponentActivity() {
     private fun autoStopEngine(clearSessionState: Boolean = true) {
         centerSticks()
         sendSticks(force = true)
+        stopVideoReceiver()
+        resetFlightMapSessionState()
         sendSimpleAction(FlightEngineService.ACTION_VIDEO_OFF)
         startService(
             Intent(this, FlightEngineService::class.java)
@@ -3899,45 +3919,64 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onFirstVideoFrameDecoded() {
-        waitingForFirstVideoFrame = false
-        videoBootstrapJob?.cancel()
-        videoBootstrapJob = null
-        updateMiniVideoStatus()
+        cancelVideoBootstrap()
+        videoRecoveryAttempts = 0
+        videoRecoveryExhaustedLogged = false
+        updateVideoStatusUi()
     }
 
     private fun startVideoBootstrapRecovery() {
-        videoBootstrapJob?.cancel()
-        waitingForFirstVideoFrame = true
-        updateMiniVideoStatus()
+        cancelVideoBootstrap()
+        videoBootstrapActive = true
+        videoBootstrapStartedAtMs = System.currentTimeMillis()
+        updateVideoStatusUi()
         videoBootstrapJob = lifecycleScope.launch {
             delay(VIDEO_BOOTSTRAP_INITIAL_DELAY_MS)
             var retryCount = 0
-            while (waitingForFirstVideoFrame && retryCount < VIDEO_BOOTSTRAP_MAX_RETRIES) {
+            while (isActive && videoBootstrapActive && retryCount < VIDEO_BOOTSTRAP_MAX_RETRIES) {
                 sendSimpleAction(FlightEngineService.ACTION_VIDEO_ON)
                 retryCount += 1
                 delay(VIDEO_BOOTSTRAP_RETRY_DELAY_MS)
             }
+            if (!isActive) return@launch
+            if (videoBootstrapActive) {
+                cancelVideoBootstrap()
+                updateVideoStatusUi()
+            }
         }
     }
 
-    private fun startVideoReceiverIfPossible() {
-        if (videoReceiver.isRunning()) return
+    private fun startVideoReceiverIfPossible(
+        state: FlightState = FlightSessionStore.state.value,
+        forceRestart: Boolean = false,
+    ) {
+        if (!shouldMaintainVideoSession(state)) return
+        if (forceRestart) {
+            stopVideoReceiver(resetRecoveryState = false)
+        } else if (videoReceiver.isRunning()) {
+            updateVideoStatusUi(state)
+            return
+        }
         val surface = previewSurface
         if (!surfaceAvailable || surface == null || !surface.isValid) return
         val videoPort = readConfigFromPrefs()?.streamVideoPort ?: readConfigFromInputs()?.streamVideoPort ?: return
-        videoReceiver.start(surface, videoPort)
-        startVideoBootstrapRecovery()
-        updateMiniVideoStatus()
+        if (videoReceiver.start(surface, videoPort)) {
+            startVideoBootstrapRecovery()
+        } else {
+            cancelVideoBootstrap()
+            updateVideoStatusUi(state)
+        }
     }
 
-    private fun stopVideoReceiver() {
-        videoBootstrapJob?.cancel()
-        videoBootstrapJob = null
-        waitingForFirstVideoFrame = false
-        if (videoReceiver.isRunning()) {
+    private fun stopVideoReceiver(resetRecoveryState: Boolean = true) {
+        cancelVideoBootstrap()
+        if (resetRecoveryState) {
+            resetVideoRecoveryState()
+        }
+        if (::videoReceiver.isInitialized && videoReceiver.isRunning()) {
             videoReceiver.stop()
         }
-        updateMiniVideoStatus()
+        updateVideoStatusUi()
     }
 
     private fun readConfigFromInputs(): FlightConfig? {
@@ -3962,14 +4001,7 @@ class MainActivity : ComponentActivity() {
             streamVideoPort = prefs.getInt(PREF_KEY_STREAM_VIDEO_PORT, 55004),
             streamControlPort = prefs.getInt(PREF_KEY_STREAM_CONTROL_PORT, 55005),
         )
-        return FlightInputParsers.parseConfig(
-            discoIp = rawConfig.discoIp,
-            discoveryPort = rawConfig.discoveryPort.toString(),
-            c2dPort = rawConfig.c2dPort.toString(),
-            d2cPort = rawConfig.d2cPort.toString(),
-            streamVideoPort = rawConfig.streamVideoPort.toString(),
-            streamControlPort = rawConfig.streamControlPort.toString(),
-        ).value
+        return FlightPersistenceSanitizer.sanitizeConfig(rawConfig, defaultFlightConfig()).value
     }
 
     private fun readFlightSettingsFromInputs(): FlightSettings? {
@@ -3998,16 +4030,7 @@ class MainActivity : ComponentActivity() {
             loiterRadiusMeters = prefs.getInt(PREF_KEY_LOITER_RADIUS_M, DEFAULT_LOITER_RADIUS_M),
             loiterAltitudeMeters = prefs.getFloat(PREF_KEY_LOITER_ALTITUDE_M, DEFAULT_LOITER_ALTITUDE_M),
         )
-        return FlightInputParsers.parseFlightSettings(
-            maxAltitude = rawSettings.maxAltitudeMeters.toString(),
-            minAltitude = rawSettings.minAltitudeMeters.toString(),
-            maxDistance = rawSettings.maxDistanceMeters.toString(),
-            geofenceEnabled = rawSettings.geofenceEnabled,
-            rthMinAltitude = rawSettings.rthMinAltitudeMeters.toString(),
-            rthDelay = rawSettings.rthDelaySeconds.toString(),
-            loiterRadius = rawSettings.loiterRadiusMeters.toString(),
-            loiterAltitude = rawSettings.loiterAltitudeMeters.toString(),
-        ).value ?: rawSettings
+        return FlightPersistenceSanitizer.sanitizeSettings(rawSettings, defaultFlightSettings()).value
     }
 
     private fun saveFlightSettings(settings: FlightSettings) {
@@ -4024,7 +4047,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun restoreFlightSettings() {
-        val settings = readFlightSettingsFromPrefs()
+        val rawSettings = FlightSettings(
+            maxAltitudeMeters = prefs.getFloat(PREF_KEY_MAX_ALTITUDE_M, DEFAULT_MAX_ALTITUDE_M),
+            minAltitudeMeters = prefs.getFloat(PREF_KEY_MIN_ALTITUDE_M, DEFAULT_MIN_ALTITUDE_M),
+            maxDistanceMeters = prefs.getFloat(PREF_KEY_MAX_DISTANCE_M, DEFAULT_MAX_DISTANCE_M),
+            geofenceEnabled = prefs.getBoolean(PREF_KEY_GEOFENCE_ENABLED, DEFAULT_GEOFENCE_ENABLED),
+            rthMinAltitudeMeters = prefs.getFloat(PREF_KEY_RTH_MIN_ALTITUDE_M, DEFAULT_RTH_MIN_ALTITUDE_M),
+            rthDelaySeconds = prefs.getInt(PREF_KEY_RTH_DELAY_SEC, DEFAULT_RTH_DELAY_SEC),
+            loiterRadiusMeters = prefs.getInt(PREF_KEY_LOITER_RADIUS_M, DEFAULT_LOITER_RADIUS_M),
+            loiterAltitudeMeters = prefs.getFloat(PREF_KEY_LOITER_ALTITUDE_M, DEFAULT_LOITER_ALTITUDE_M),
+        )
+        val sanitized = FlightPersistenceSanitizer.sanitizeSettings(rawSettings, defaultFlightSettings())
+        if (sanitized.corrected) {
+            saveFlightSettings(sanitized.value)
+            appendCommandEvent(
+                "Settings prefs invalid; restored safe defaults (${sanitized.reason ?: "invalid stored values"})",
+            )
+        }
+        val settings = sanitized.value
         etMaxAltitude.setText(formatInputFloat(settings.maxAltitudeMeters))
         etMinAltitude.setText(formatInputFloat(settings.minAltitudeMeters))
         etMaxDistance.setText(formatInputFloat(settings.maxDistanceMeters))
@@ -4085,12 +4125,28 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun restoreConfig() {
-        etDiscoIp.setText(prefs.getString(PREF_KEY_DISCO_IP, "10.147.0.10"))
-        etDiscoveryPort.setText(prefs.getInt(PREF_KEY_DISCOVERY_PORT, 44444).toString())
-        etC2dPort.setText(prefs.getInt(PREF_KEY_C2D_PORT, 54321).toString())
-        etD2cPort.setText(prefs.getInt(PREF_KEY_D2C_PORT, 9988).toString())
-        etStreamVideoPort.setText(prefs.getInt(PREF_KEY_STREAM_VIDEO_PORT, 55004).toString())
-        etStreamControlPort.setText(prefs.getInt(PREF_KEY_STREAM_CONTROL_PORT, 55005).toString())
+        val rawConfig = FlightConfig(
+            discoIp = prefs.getString(PREF_KEY_DISCO_IP, "10.147.0.10").orEmpty(),
+            discoveryPort = prefs.getInt(PREF_KEY_DISCOVERY_PORT, 44444),
+            c2dPort = prefs.getInt(PREF_KEY_C2D_PORT, 54321),
+            d2cPort = prefs.getInt(PREF_KEY_D2C_PORT, 9988),
+            streamVideoPort = prefs.getInt(PREF_KEY_STREAM_VIDEO_PORT, 55004),
+            streamControlPort = prefs.getInt(PREF_KEY_STREAM_CONTROL_PORT, 55005),
+        )
+        val sanitized = FlightPersistenceSanitizer.sanitizeConfig(rawConfig, defaultFlightConfig())
+        if (sanitized.corrected) {
+            saveConfig(sanitized.value)
+            appendCommandEvent(
+                "Config prefs invalid; restored safe defaults (${sanitized.reason ?: "invalid stored values"})",
+            )
+        }
+        val config = sanitized.value
+        etDiscoIp.setText(config.discoIp)
+        etDiscoveryPort.setText(config.discoveryPort.toString())
+        etC2dPort.setText(config.c2dPort.toString())
+        etD2cPort.setText(config.d2cPort.toString())
+        etStreamVideoPort.setText(config.streamVideoPort.toString())
+        etStreamControlPort.setText(config.streamControlPort.toString())
         configVisible = prefs.getBoolean(PREF_KEY_CONFIG_VISIBLE, false)
         applyConfigPanelUi()
     }
@@ -4141,12 +4197,19 @@ class MainActivity : ComponentActivity() {
 
     private fun setFlightViewMode(mode: FlightViewMode) {
         if (flightViewMode == mode) return
+        if (mode == FlightViewMode.MAP_FOCUS) {
+            val mapModel = currentFlightMapModel()
+            if (!mapModel.focusTargetAvailable) {
+                updateMapStatusUi(mapModel)
+                showStatusToast(mapModel.overlayLabel ?: "position unavailable")
+                return
+            }
+        }
         flightViewMode = mode
         applyFlightViewModeUi()
         when (mode) {
             FlightViewMode.MAP_FOCUS -> {
-                mapFlight.controller.setZoom(FLIGHT_MAP_FOCUS_ZOOM)
-                focusFlightMapOnBestKnownPosition(forceZoom = !flightMapHasCentered)
+                focusFlightMapOnBestKnownPosition(forceZoom = true)
             }
 
             FlightViewMode.VIDEO_FOCUS -> {
@@ -4227,7 +4290,8 @@ class MainActivity : ComponentActivity() {
         textureVideo.post {
             applyVideoAspectTransform(textureVideo.width, textureVideo.height)
         }
-        updateMiniVideoStatus()
+        updateVideoStatusUi()
+        updateMapStatusUi()
         if (!missionVisible && !configVisible) {
             when (flightViewMode) {
                 FlightViewMode.VIDEO_FOCUS -> mapFlightContainer.bringToFront()
@@ -4643,15 +4707,171 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun shouldMaintainVideoSession(state: FlightState): Boolean {
+        return state.engineRunning && state.discoveryOk && state.transportReady
+    }
+
+    private fun currentVideoReceiverSnapshot(): VideoReceiverSnapshot {
+        return if (::videoReceiver.isInitialized) {
+            videoReceiver.snapshot()
+        } else {
+            VideoReceiverSnapshot()
+        }
+    }
+
+    private fun currentVideoFeedModel(
+        state: FlightState = FlightSessionStore.state.value,
+        nowMs: Long = System.currentTimeMillis(),
+    ): VideoFeedModel {
+        return VideoFeedEvaluator.evaluate(
+            engineRunning = state.engineRunning,
+            discoveryOk = state.discoveryOk,
+            transportReady = state.transportReady,
+            surfaceReady = surfaceAvailable && (previewSurface?.isValid == true),
+            bootstrapActive = videoBootstrapActive,
+            bootstrapStartedAtMs = videoBootstrapStartedAtMs,
+            snapshot = currentVideoReceiverSnapshot(),
+            nowMs = nowMs,
+            startupTimeoutMs = VIDEO_START_TIMEOUT_MS,
+            staleFrameMs = VIDEO_STALE_FRAME_MS,
+            stalePacketMs = VIDEO_STALE_PACKET_MS,
+        )
+    }
+
+    private fun maybeAttemptVideoRecovery(
+        state: FlightState,
+        model: VideoFeedModel,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        if (model.state == VideoFeedState.LIVE) {
+            if (videoLiveStableSinceAtMs <= 0L) {
+                videoLiveStableSinceAtMs = nowMs
+            }
+            if (nowMs - videoLiveStableSinceAtMs >= VIDEO_RECOVERY_RESET_AFTER_LIVE_MS) {
+                videoRecoveryAttempts = 0
+                videoRecoveryExhaustedLogged = false
+            }
+            return
+        }
+        videoLiveStableSinceAtMs = 0L
+        if (!model.shouldAttemptRecovery || !shouldMaintainVideoSession(state)) return
+        if (videoBootstrapActive || reconnectInProgress) return
+        if (!surfaceAvailable || previewSurface?.isValid != true) return
+        if (nowMs - lastVideoRecoveryAttemptAtMs < VIDEO_RECOVERY_COOLDOWN_MS) return
+        if (videoRecoveryAttempts >= VIDEO_MAX_RECOVERY_ATTEMPTS) {
+            if (!videoRecoveryExhaustedLogged) {
+                appendCommandEvent("Video recovery exhausted. Reconnect required.")
+                videoRecoveryExhaustedLogged = true
+            }
+            return
+        }
+
+        videoRecoveryAttempts += 1
+        lastVideoRecoveryAttemptAtMs = nowMs
+        val reason = when (model.state) {
+            VideoFeedState.STALE -> "stale stream"
+            VideoFeedState.NO_VIDEO -> "no video"
+            VideoFeedState.DECODER_FAILED -> "decoder"
+            else -> "video"
+        }
+        appendCommandEvent("Video recovery $videoRecoveryAttempts/$VIDEO_MAX_RECOVERY_ATTEMPTS ($reason)")
+        sendSimpleAction(FlightEngineService.ACTION_VIDEO_ON)
+        startVideoReceiverIfPossible(state, forceRestart = true)
+    }
+
+    private fun cancelVideoBootstrap() {
+        videoBootstrapJob?.cancel()
+        videoBootstrapJob = null
+        videoBootstrapActive = false
+        videoBootstrapStartedAtMs = 0L
+    }
+
+    private fun resetVideoRecoveryState() {
+        videoRecoveryAttempts = 0
+        lastVideoRecoveryAttemptAtMs = 0L
+        videoRecoveryExhaustedLogged = false
+        videoLiveStableSinceAtMs = 0L
+        lastLoggedVideoFeedState = null
+    }
+
+    private fun resetFlightMapSessionState() {
+        flightTrailPoints.clear()
+        lastFlightTrailPoint = null
+        lastMiniMapFollowPoint = null
+        lastFlightMapUpdateAtMs = 0L
+        flightMapHasCentered = false
+
+        if (!::mapFlight.isInitialized) return
+        flightTrackPolyline?.let { mapFlight.overlays.remove(it) }
+        flightPlaneMarker?.let { mapFlight.overlays.remove(it) }
+        flightPilotMarker?.let { mapFlight.overlays.remove(it) }
+        flightTrackPolyline = null
+        flightPlaneMarker = null
+        flightPilotMarker = null
+        mapFlight.controller.setCenter(GeoPoint(DEFAULT_MISSION_MAP_LAT, DEFAULT_MISSION_MAP_LON))
+        mapFlight.controller.setZoom(if (flightViewMode == FlightViewMode.MAP_FOCUS) FLIGHT_MAP_FOCUS_ZOOM else FLIGHT_MAP_MINI_ZOOM)
+        mapFlight.invalidate()
+    }
+
+    private fun defaultFlightConfig() = FlightConfig(
+        discoIp = "10.147.0.10",
+        discoveryPort = 44444,
+        c2dPort = 54321,
+        d2cPort = 9988,
+        streamVideoPort = 55004,
+        streamControlPort = 55005,
+    )
+
+    private fun defaultFlightSettings() = FlightSettings(
+        maxAltitudeMeters = DEFAULT_MAX_ALTITUDE_M,
+        minAltitudeMeters = DEFAULT_MIN_ALTITUDE_M,
+        maxDistanceMeters = DEFAULT_MAX_DISTANCE_M,
+        geofenceEnabled = DEFAULT_GEOFENCE_ENABLED,
+        rthMinAltitudeMeters = DEFAULT_RTH_MIN_ALTITUDE_M,
+        rthDelaySeconds = DEFAULT_RTH_DELAY_SEC,
+        loiterRadiusMeters = DEFAULT_LOITER_RADIUS_M,
+        loiterAltitudeMeters = DEFAULT_LOITER_ALTITUDE_M,
+    )
+
+    private fun currentFlightMapModel(
+        state: FlightState = FlightSessionStore.state.value,
+        planePoint: GeoPoint? = toValidGeoPoint(state.latitude, state.longitude),
+        pilotPoint: GeoPoint? = toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude),
+    ): FlightMapModel {
+        return FlightMapEvaluator.evaluate(
+            planePositionAvailable = planePoint != null,
+            pilotPositionAvailable = pilotPoint != null,
+            telemetryAgeMs = telemetryAgeMs(state),
+            telemetryStaleAgeMs = TELEMETRY_STALE_AGE_MS,
+        )
+    }
+
+    private fun bestKnownFlightMapTarget(state: FlightState = FlightSessionStore.state.value): GeoPoint? {
+        val rawPlanePoint = toValidGeoPoint(state.latitude, state.longitude)
+        val pilotPoint = toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
+        val mapModel = currentFlightMapModel(state, rawPlanePoint, pilotPoint)
+        return rawPlanePoint.takeIf { mapModel.showPlaneMarker } ?: pilotPoint
+    }
+
+    private fun updateMapStatusUi(
+        model: FlightMapModel = currentFlightMapModel(),
+    ) {
+        if (!::tvMapStatusOverlay.isInitialized) return
+        if (model.overlayLabel.isNullOrBlank()) {
+            tvMapStatusOverlay.visibility = View.GONE
+            return
+        }
+        tvMapStatusOverlay.text = model.overlayLabel
+        tvMapStatusOverlay.visibility = View.VISIBLE
+    }
+
     override fun onDestroy() {
         stopModemTelemetryPolling()
         stopLocationUpdates()
         missionUploadJob?.cancel()
         dryRunJob?.cancel()
         reconnectJob?.cancel()
-        videoBootstrapJob?.cancel()
-        videoBootstrapJob = null
-        waitingForFirstVideoFrame = false
+        cancelVideoBootstrap()
         setReconnectUi(false)
         if (isFinishing && !isChangingConfigurations) {
             autoStopEngine()
