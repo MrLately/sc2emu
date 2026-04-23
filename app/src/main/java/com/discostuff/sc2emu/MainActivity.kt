@@ -39,6 +39,7 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -189,6 +190,16 @@ class MainActivity : ComponentActivity() {
         private const val VIDEO_BOOTSTRAP_INITIAL_DELAY_MS = 450L
         private const val VIDEO_BOOTSTRAP_RETRY_DELAY_MS = 1_800L
         private const val VIDEO_BOOTSTRAP_MAX_RETRIES = 2
+        private const val FLIGHT_MAP_UPDATE_INTERVAL_MS = 350L
+        private const val FLIGHT_MAP_TRAIL_MAX_POINTS = 64
+        private const val FLIGHT_MAP_TRAIL_MIN_STEP_M = 3.0
+        private const val FLIGHT_MAP_MINI_FOLLOW_MIN_STEP_M = 2.0
+        private const val FLIGHT_MAP_MINI_ZOOM = 15.8
+        private const val FLIGHT_MAP_FOCUS_ZOOM = 17.5
+        private const val MINI_MEDIA_WIDTH_DP = 160
+        private const val MINI_MEDIA_HEIGHT_DP = 122
+        private const val MINI_MEDIA_MARGIN_START_DP = 116
+        private const val MINI_MEDIA_MARGIN_TOP_DP = 8
     }
 
     private enum class MissionPattern(val label: String) {
@@ -244,6 +255,11 @@ class MainActivity : ComponentActivity() {
         INFO,
         WARN,
         CRITICAL,
+    }
+
+    private enum class FlightViewMode {
+        VIDEO_FOCUS,
+        MAP_FOCUS,
     }
 
     private data class MissionNode(
@@ -314,6 +330,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var btnSettings: ImageButton
     private lateinit var btnMission: ImageButton
+    private lateinit var topActionBar: View
     private lateinit var btnTakeoffLand: Button
     private lateinit var btnRth: Button
     private lateinit var btnApplyConfig: Button
@@ -340,11 +357,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var btnMissionCtrlAbort: Button
     private lateinit var tvSafetyBanner: TextView
 
+    private lateinit var videoStreamContainer: FrameLayout
     private lateinit var textureVideo: TextureView
+    private lateinit var tvMiniVideoStatus: TextView
+    private lateinit var mapFlightContainer: FrameLayout
+    private lateinit var mapFlight: MapView
     private lateinit var stickLeft: VirtualStickView
     private lateinit var stickRight: VirtualStickView
     private lateinit var attitudeIndicatorContainer: View
     private lateinit var attitudeHorizonLine: View
+    private lateinit var infoBar: View
     private lateinit var tvInfoSpeed: TextView
     private lateinit var tvInfoAltitude: TextView
     private lateinit var tvInfoDistance: TextView
@@ -385,6 +407,7 @@ class MainActivity : ComponentActivity() {
     private var missionToolsExpanded = false
     private var missionExecutionState = MissionExecutionState.IDLE
     private var airborne = false
+    private var flightViewMode = FlightViewMode.VIDEO_FOCUS
 
     private var pitchAxis = 0
     private var rollAxis = 0
@@ -439,6 +462,14 @@ class MainActivity : ComponentActivity() {
     private var dryRunProgressMeters: Double = 0.0
     private var dryRunTotalMeters: Double = 0.0
     private var dryRunMarker: Marker? = null
+    private var flightPlaneMarker: Marker? = null
+    private var flightPilotMarker: Marker? = null
+    private var flightTrackPolyline: Polyline? = null
+    private val flightTrailPoints = ArrayDeque<GeoPoint>()
+    private var lastFlightTrailPoint: GeoPoint? = null
+    private var lastMiniMapFollowPoint: GeoPoint? = null
+    private var lastFlightMapUpdateAtMs: Long = 0L
+    private var flightMapHasCentered = false
     private val savedMissionPlans = mutableListOf<MissionPlan>()
     private val locationManager by lazy { getSystemService(Context.LOCATION_SERVICE) as LocationManager }
     private val locationListener = LocationListener { location ->
@@ -472,14 +503,19 @@ class MainActivity : ComponentActivity() {
         setupSettingsUi()
         setupSticks()
         setupVideoPreview()
+        setupFlightMap()
         setupMissionPlanner()
         applyConfigPanelUi()
         applyMissionPanelUi()
+        applyFlightViewModeUi()
         observeState()
     }
 
     override fun onResume() {
         super.onResume()
+        if (::mapFlight.isInitialized) {
+            mapFlight.onResume()
+        }
         if (::mapMission.isInitialized) {
             mapMission.onResume()
         }
@@ -488,6 +524,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        if (::mapFlight.isInitialized) {
+            mapFlight.onPause()
+        }
         if (::mapMission.isInitialized) {
             saveMissionViewport()
             mapMission.onPause()
@@ -552,6 +591,7 @@ class MainActivity : ComponentActivity() {
 
         btnSettings = findViewById(R.id.btnSettings)
         btnMission = findViewById(R.id.btnMission)
+        topActionBar = findViewById(R.id.topActionBar)
         btnTakeoffLand = findViewById(R.id.btnTakeoffLand)
         btnRth = findViewById(R.id.btnRth)
         btnApplyConfig = findViewById(R.id.btnApplyConfig)
@@ -578,11 +618,16 @@ class MainActivity : ComponentActivity() {
         btnMissionCtrlAbort = findViewById(R.id.btnMissionCtrlAbort)
         tvSafetyBanner = findViewById(R.id.tvSafetyBanner)
 
+        videoStreamContainer = findViewById(R.id.videoStreamContainer)
         textureVideo = findViewById(R.id.textureVideo)
+        tvMiniVideoStatus = findViewById(R.id.tvMiniVideoStatus)
+        mapFlightContainer = findViewById(R.id.mapFlightContainer)
+        mapFlight = findViewById(R.id.mapFlight)
         stickLeft = findViewById(R.id.stickLeft)
         stickRight = findViewById(R.id.stickRight)
         attitudeIndicatorContainer = findViewById(R.id.attitudeIndicatorContainer)
         attitudeHorizonLine = findViewById(R.id.attitudeHorizonLine)
+        infoBar = findViewById(R.id.infoBar)
         tvInfoSpeed = findViewById(R.id.tvInfoSpeed)
         tvInfoAltitude = findViewById(R.id.tvInfoAltitude)
         tvInfoDistance = findViewById(R.id.tvInfoDistance)
@@ -907,6 +952,32 @@ class MainActivity : ComponentActivity() {
 
             override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
         }
+
+        videoStreamContainer.setOnClickListener {
+            if (flightViewMode == FlightViewMode.MAP_FOCUS && !missionVisible && !configVisible) {
+                setFlightViewMode(FlightViewMode.VIDEO_FOCUS)
+            }
+        }
+    }
+
+    private fun setupFlightMap() {
+        mapFlight.setTileSource(TileSourceFactory.MAPNIK)
+        mapFlight.setMultiTouchControls(false)
+        mapFlight.isTilesScaledToDpi = true
+        mapFlight.controller.setZoom(FLIGHT_MAP_MINI_ZOOM)
+        mapFlight.controller.setCenter(GeoPoint(DEFAULT_MISSION_MAP_LAT, DEFAULT_MISSION_MAP_LON))
+
+        mapFlight.setOnTouchListener { _, event ->
+            if (flightViewMode == FlightViewMode.VIDEO_FOCUS) {
+                if (event.actionMasked == MotionEvent.ACTION_UP && !missionVisible && !configVisible) {
+                    setFlightViewMode(FlightViewMode.MAP_FOCUS)
+                }
+                return@setOnTouchListener true
+            }
+            false
+        }
+
+        renderFlightMap(FlightSessionStore.state.value, force = true)
     }
 
     private fun setupMissionPlanner() {
@@ -2828,6 +2899,8 @@ class MainActivity : ComponentActivity() {
 
                     updateAttitudeIndicator(state)
                     renderInfo(state)
+                    updateMiniVideoStatus(state)
+                    renderFlightMap(state)
                     updateSafetyBanner(state)
                     updateMissionControlUi()
                 }
@@ -3263,6 +3336,188 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun updateMiniVideoStatus(state: FlightState = FlightSessionStore.state.value) {
+        if (!::tvMiniVideoStatus.isInitialized) return
+        if (flightViewMode != FlightViewMode.MAP_FOCUS) {
+            tvMiniVideoStatus.visibility = View.GONE
+            return
+        }
+
+        val videoRunning = ::videoReceiver.isInitialized && videoReceiver.isRunning()
+        val hasLink = state.engineRunning && state.discoveryOk && state.transportReady
+        val waitingFrame = waitingForFirstVideoFrame
+
+        val message = when {
+            !state.engineRunning -> "Engine Off"
+            !state.discoveryOk -> "No Link"
+            !state.transportReady -> "Transport"
+            waitingFrame -> "Waiting Video"
+            !videoRunning -> "No Video"
+            else -> null
+        }
+
+        if (message == null) {
+            tvMiniVideoStatus.visibility = View.GONE
+            return
+        }
+        if (!hasLink && message == "No Video") {
+            tvMiniVideoStatus.text = "No Link"
+        } else {
+            tvMiniVideoStatus.text = message
+        }
+        tvMiniVideoStatus.visibility = View.VISIBLE
+    }
+
+    private fun renderFlightMap(state: FlightState, force: Boolean = false) {
+        if (!::mapFlight.isInitialized) return
+        val now = System.currentTimeMillis()
+        if (!force && (now - lastFlightMapUpdateAtMs) < FLIGHT_MAP_UPDATE_INTERVAL_MS) return
+        lastFlightMapUpdateAtMs = now
+
+        val planePoint = toValidGeoPoint(state.latitude, state.longitude)
+        val pilotPoint = toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
+
+        if (planePoint != null) {
+            val marker = flightPlaneMarker ?: Marker(mapFlight).apply {
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                title = "Plane"
+                icon = createFlightMarkerIconDrawable("PL", Color.parseColor("#FFF44336"))
+                flightPlaneMarker = this
+            }
+            marker.position = planePoint
+            if (!mapFlight.overlays.contains(marker)) {
+                mapFlight.overlays.add(marker)
+            }
+        } else {
+            flightPlaneMarker?.let { mapFlight.overlays.remove(it) }
+            flightPlaneMarker = null
+        }
+
+        if (pilotPoint != null) {
+            val marker = flightPilotMarker ?: Marker(mapFlight).apply {
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                title = "Pilot"
+                icon = createFlightMarkerIconDrawable("PH", Color.parseColor("#FF1E88E5"))
+                flightPilotMarker = this
+            }
+            marker.position = pilotPoint
+            if (!mapFlight.overlays.contains(marker)) {
+                mapFlight.overlays.add(marker)
+            }
+        } else {
+            flightPilotMarker?.let { mapFlight.overlays.remove(it) }
+            flightPilotMarker = null
+        }
+
+        updateFlightTrail(planePoint)
+        if (flightViewMode == FlightViewMode.VIDEO_FOCUS) {
+            followMiniFlightMap(planePoint ?: pilotPoint)
+        }
+        if (!flightMapHasCentered) {
+            focusFlightMapOnBestKnownPosition(forceZoom = flightViewMode == FlightViewMode.MAP_FOCUS)
+        }
+        mapFlight.invalidate()
+    }
+
+    private fun toValidGeoPoint(latitude: Double?, longitude: Double?): GeoPoint? {
+        if (latitude == null || longitude == null) return null
+        if (!latitude.isFinite() || !longitude.isFinite()) return null
+        if (latitude == 0.0 && longitude == 0.0) return null
+        return GeoPoint(latitude, longitude)
+    }
+
+    private fun updateFlightTrail(planePoint: GeoPoint?) {
+        if (planePoint == null) return
+        val last = lastFlightTrailPoint
+        if (last == null || haversineMeters(last.latitude, last.longitude, planePoint.latitude, planePoint.longitude) >= FLIGHT_MAP_TRAIL_MIN_STEP_M) {
+            flightTrailPoints.addLast(planePoint)
+            while (flightTrailPoints.size > FLIGHT_MAP_TRAIL_MAX_POINTS) {
+                flightTrailPoints.removeFirst()
+            }
+            lastFlightTrailPoint = planePoint
+        }
+
+        if (flightTrailPoints.size < 2) return
+
+        val track = flightTrackPolyline ?: Polyline().apply {
+            outlinePaint.color = Color.parseColor("#CCFFD54F")
+            outlinePaint.strokeWidth = 3.5f
+            outlinePaint.isAntiAlias = true
+            flightTrackPolyline = this
+        }
+        track.setPoints(flightTrailPoints.toList())
+        if (!mapFlight.overlays.contains(track)) {
+            mapFlight.overlays.add(0, track)
+        }
+    }
+
+    private fun followMiniFlightMap(target: GeoPoint?) {
+        if (target == null) return
+        val last = lastMiniMapFollowPoint
+        val shouldUpdate = last == null ||
+            haversineMeters(last.latitude, last.longitude, target.latitude, target.longitude) >= FLIGHT_MAP_MINI_FOLLOW_MIN_STEP_M
+        if (!shouldUpdate) return
+        mapFlight.controller.setCenter(target)
+        lastMiniMapFollowPoint = target
+    }
+
+    private fun focusFlightMapOnBestKnownPosition(forceZoom: Boolean): Boolean {
+        val state = FlightSessionStore.state.value
+        val target = toValidGeoPoint(state.latitude, state.longitude)
+            ?: toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
+            ?: return false
+        if (forceZoom) {
+            mapFlight.controller.setZoom(FLIGHT_MAP_FOCUS_ZOOM)
+        }
+        mapFlight.controller.animateTo(target)
+        flightMapHasCentered = true
+        return true
+    }
+
+    private fun centerMiniFlightMapOnBestKnownPosition(): Boolean {
+        val state = FlightSessionStore.state.value
+        val target = toValidGeoPoint(state.latitude, state.longitude)
+            ?: toValidGeoPoint(pilotPhoneLatitude, pilotPhoneLongitude)
+            ?: return false
+        mapFlight.controller.setCenter(target)
+        lastMiniMapFollowPoint = target
+        return true
+    }
+
+    private fun createFlightMarkerIconDrawable(label: String, fillColor: Int): BitmapDrawable {
+        val sizePx = (30f * resources.displayMetrics.density).toInt().coerceAtLeast(48)
+        val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+
+        val radius = (sizePx / 2f) - (2f * resources.displayMetrics.density)
+        val cx = sizePx / 2f
+        val cy = sizePx / 2f
+
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = fillColor
+            style = Paint.Style.FILL
+        }
+        canvas.drawCircle(cx, cy, radius, fillPaint)
+
+        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            strokeWidth = (2f * resources.displayMetrics.density).coerceAtLeast(2f)
+            style = Paint.Style.STROKE
+        }
+        canvas.drawCircle(cx, cy, radius, strokePaint)
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = (10f * resources.displayMetrics.scaledDensity)
+        }
+        val textY = cy - ((textPaint.descent() + textPaint.ascent()) / 2f)
+        canvas.drawText(label, cx, textY, textPaint)
+
+        return BitmapDrawable(resources, bitmap)
+    }
+
     private fun telemetryAgeMs(state: FlightState): Long? {
         val at = state.lastTelemetryAtMs ?: return null
         return (System.currentTimeMillis() - at).coerceAtLeast(0L)
@@ -3647,11 +3902,13 @@ class MainActivity : ComponentActivity() {
         waitingForFirstVideoFrame = false
         videoBootstrapJob?.cancel()
         videoBootstrapJob = null
+        updateMiniVideoStatus()
     }
 
     private fun startVideoBootstrapRecovery() {
         videoBootstrapJob?.cancel()
         waitingForFirstVideoFrame = true
+        updateMiniVideoStatus()
         videoBootstrapJob = lifecycleScope.launch {
             delay(VIDEO_BOOTSTRAP_INITIAL_DELAY_MS)
             var retryCount = 0
@@ -3670,6 +3927,7 @@ class MainActivity : ComponentActivity() {
         val videoPort = readConfigFromPrefs()?.streamVideoPort ?: readConfigFromInputs()?.streamVideoPort ?: return
         videoReceiver.start(surface, videoPort)
         startVideoBootstrapRecovery()
+        updateMiniVideoStatus()
     }
 
     private fun stopVideoReceiver() {
@@ -3679,6 +3937,7 @@ class MainActivity : ComponentActivity() {
         if (videoReceiver.isRunning()) {
             videoReceiver.stop()
         }
+        updateMiniVideoStatus()
     }
 
     private fun readConfigFromInputs(): FlightConfig? {
@@ -3850,6 +4109,9 @@ class MainActivity : ComponentActivity() {
             panelConfig.translationZ = 100f
         } else {
             panelConfig.translationZ = 0f
+            if (!missionVisible) {
+                bringFlightOverlaysToFront()
+            }
         }
     }
 
@@ -3870,8 +4132,125 @@ class MainActivity : ComponentActivity() {
                 dryRunJob = null
                 updateDryRunUi()
             }
+            if (!configVisible) {
+                bringFlightOverlaysToFront()
+            }
         }
         updateMissionControlUi()
+    }
+
+    private fun setFlightViewMode(mode: FlightViewMode) {
+        if (flightViewMode == mode) return
+        flightViewMode = mode
+        applyFlightViewModeUi()
+        when (mode) {
+            FlightViewMode.MAP_FOCUS -> {
+                mapFlight.controller.setZoom(FLIGHT_MAP_FOCUS_ZOOM)
+                focusFlightMapOnBestKnownPosition(forceZoom = !flightMapHasCentered)
+            }
+
+            FlightViewMode.VIDEO_FOCUS -> {
+                mapFlight.controller.setZoom(FLIGHT_MAP_MINI_ZOOM)
+                lastMiniMapFollowPoint = null
+                centerMiniFlightMapOnBestKnownPosition()
+            }
+        }
+    }
+
+    private fun applyFlightViewModeUi() {
+        if (!::mapFlightContainer.isInitialized || !::videoStreamContainer.isInitialized) return
+        val miniWidthPx = dpToPx(MINI_MEDIA_WIDTH_DP)
+        val miniHeightPx = dpToPx(MINI_MEDIA_HEIGHT_DP)
+        val miniMarginStartPx = dpToPx(MINI_MEDIA_MARGIN_START_DP)
+        val miniMarginTopPx = dpToPx(MINI_MEDIA_MARGIN_TOP_DP)
+
+        val mapParams = (mapFlightContainer.layoutParams as FrameLayout.LayoutParams).apply {
+            when (flightViewMode) {
+                FlightViewMode.VIDEO_FOCUS -> {
+                    width = miniWidthPx
+                    height = miniHeightPx
+                    gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                    marginStart = miniMarginStartPx
+                    topMargin = miniMarginTopPx
+                    marginEnd = 0
+                    bottomMargin = 0
+                }
+
+                FlightViewMode.MAP_FOCUS -> {
+                    width = FrameLayout.LayoutParams.MATCH_PARENT
+                    height = FrameLayout.LayoutParams.MATCH_PARENT
+                    gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                    marginStart = 0
+                    topMargin = 0
+                    marginEnd = 0
+                    bottomMargin = 0
+                }
+            }
+        }
+        mapFlightContainer.layoutParams = mapParams
+
+        val videoParams = (videoStreamContainer.layoutParams as FrameLayout.LayoutParams).apply {
+            when (flightViewMode) {
+                FlightViewMode.VIDEO_FOCUS -> {
+                    width = FrameLayout.LayoutParams.MATCH_PARENT
+                    height = FrameLayout.LayoutParams.MATCH_PARENT
+                    gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                    marginStart = 0
+                    topMargin = 0
+                    marginEnd = 0
+                    bottomMargin = 0
+                }
+
+                FlightViewMode.MAP_FOCUS -> {
+                    width = miniWidthPx
+                    height = miniHeightPx
+                    gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                    marginStart = miniMarginStartPx
+                    topMargin = miniMarginTopPx
+                    marginEnd = 0
+                    bottomMargin = 0
+                }
+            }
+        }
+        videoStreamContainer.layoutParams = videoParams
+
+        when (flightViewMode) {
+            FlightViewMode.VIDEO_FOCUS -> {
+                mapFlight.setMultiTouchControls(false)
+            }
+
+            FlightViewMode.MAP_FOCUS -> {
+                mapFlight.setMultiTouchControls(true)
+            }
+        }
+
+        textureVideo.post {
+            applyVideoAspectTransform(textureVideo.width, textureVideo.height)
+        }
+        updateMiniVideoStatus()
+        if (!missionVisible && !configVisible) {
+            when (flightViewMode) {
+                FlightViewMode.VIDEO_FOCUS -> mapFlightContainer.bringToFront()
+                FlightViewMode.MAP_FOCUS -> videoStreamContainer.bringToFront()
+            }
+            bringFlightOverlaysToFront()
+        }
+    }
+
+    private fun bringFlightOverlaysToFront() {
+        btnSettings.bringToFront()
+        btnMission.bringToFront()
+        topActionBar.bringToFront()
+        missionControlBar.bringToFront()
+        tvSafetyBanner.bringToFront()
+        stickLeft.bringToFront()
+        stickRight.bringToFront()
+        attitudeIndicatorContainer.bringToFront()
+        infoBar.bringToFront()
+    }
+
+    private fun dpToPx(dp: Int): Int {
+        return (dp * resources.displayMetrics.density).toInt()
     }
 
     private fun updateMissionControlUi() {
@@ -4231,6 +4610,7 @@ class MainActivity : ComponentActivity() {
             }
 
         sendControllerGpsToPlaneIfReady()
+        renderFlightMap(FlightSessionStore.state.value, force = true)
         if (missionNodes.isEmpty()) {
             ensureStartWaypointIfKnown()
             refreshMissionMapOverlays()
@@ -4280,6 +4660,9 @@ class MainActivity : ComponentActivity() {
         saveMissionViewport()
         if (::videoReceiver.isInitialized) {
             videoReceiver.destroy()
+        }
+        if (::mapFlight.isInitialized) {
+            mapFlight.onDetach()
         }
         if (::mapMission.isInitialized) {
             mapMission.onDetach()
