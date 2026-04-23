@@ -3583,11 +3583,11 @@ class MainActivity : ComponentActivity() {
 
         tvSafetyBanner.visibility = View.VISIBLE
         tvSafetyBanner.text = banner.message
-        tvSafetyBanner.setBackgroundColor(
+        tvSafetyBanner.setBackgroundResource(
             when (banner.severity) {
-                SafetySeverity.INFO -> Color.parseColor("#CC1E3A5F")
-                SafetySeverity.WARN -> Color.parseColor("#CC7A4C00")
-                SafetySeverity.CRITICAL -> Color.parseColor("#CC7F1D1D")
+                SafetySeverity.INFO -> R.drawable.bg_safety_banner_info
+                SafetySeverity.WARN -> R.drawable.bg_safety_banner_warn
+                SafetySeverity.CRITICAL -> R.drawable.bg_safety_banner_critical
             },
         )
 
