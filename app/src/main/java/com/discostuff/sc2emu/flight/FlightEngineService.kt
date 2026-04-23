@@ -38,6 +38,9 @@ class FlightEngineService : Service() {
     companion object {
         private const val DISCOVERY_ATTEMPTS = 8
         private const val DISCOVERY_RETRY_DELAY_MS = 700L
+        private const val DISCOVERY_BACKOFF_INITIAL_MS = 2000L
+        private const val DISCOVERY_BACKOFF_MEDIUM_MS = 5000L
+        private const val DISCOVERY_BACKOFF_MAX_MS = 10000L
         private const val WATCHDOG_INTERVAL_MS = 1500L
         private const val TELEMETRY_TIMEOUT_MS = 6000L
         private const val RECONNECT_COOLDOWN_MS = 3500L
@@ -147,10 +150,21 @@ class FlightEngineService : Service() {
     @Volatile
     private var lastReconnectAtMs = 0L
 
+    @Volatile
+    private var backgroundDiscoveryFailures = 0
+
+    @Volatile
+    private var nextDiscoveryAttemptAtMs = 0L
+
     private data class DiscoveryResult(
         val ok: Boolean,
         val error: String? = null,
     )
+
+    private enum class ReconnectMode {
+        FAST_BURST,
+        BACKGROUND_SINGLE,
+    }
 
     private data class HomeReference(
         val latitude: Double,
@@ -335,7 +349,11 @@ class FlightEngineService : Service() {
 
         engineJob = serviceScope.launch {
             try {
-                val discovery = reconnectTransport(config)
+                if (watchdogJob?.isActive != true) {
+                    watchdogJob = serviceScope.launch { watchdogLoop(config) }
+                }
+
+                val discovery = reconnectTransport(config, mode = ReconnectMode.FAST_BURST)
                 if (!discovery.ok) {
                     val discoveryMessage = buildString {
                         append("discovery failed")
@@ -345,12 +363,10 @@ class FlightEngineService : Service() {
                         }
                     }
 
-                    clearNetworkResources()
-                    runningConfig = null
-                    persistEngineConfig(config, resume = false)
+                    backgroundDiscoveryFailures = 1
+                    nextDiscoveryAttemptAtMs = System.currentTimeMillis() + DISCOVERY_BACKOFF_INITIAL_MS
                     FlightSessionStore.update {
                         it.copy(
-                            engineRunning = false,
                             discoveryOk = false,
                             transportReady = false,
                             controlsArmed = controlsArmed,
@@ -358,40 +374,32 @@ class FlightEngineService : Service() {
                             homeLatitude = savedHome?.latitude,
                             homeLongitude = savedHome?.longitude,
                             homeAltitudeMeters = savedHome?.altitudeMeters,
-                            message = discoveryMessage,
+                            message = "$discoveryMessage (background retry)",
                         )
                     }
-                    refreshNotification(discoveryMessage)
-                    stopSelf()
+                    refreshNotification("discovery searching")
                     return@launch
                 }
 
-                FlightSessionStore.update {
-                    it.copy(
-                        discoveryOk = true,
-                        transportReady = isTransportReady(),
-                        controlsArmed = controlsArmed,
-                        message = "discovery ok",
-                    )
-                }
-                refreshNotification("connected")
-
-                sendAllStates()
-                sendVideoEnable(true)
-
-                lastAnyRxAtMs = System.currentTimeMillis()
-                reconnectAttempt = 0
-                reconnecting = false
-                lastReconnectAtMs = 0L
-                telemetryJob = launch { telemetryLoop(config) }
-                controlLoopJob = launch { controlLoop(config) }
-                watchdogJob = launch { watchdogLoop(config) }
+                onTransportConnected(
+                    config = config,
+                    stateMessage = "discovery ok",
+                    notificationStatus = "connected",
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                telemetryJob?.cancel()
+                controlLoopJob?.cancel()
+                watchdogJob?.cancel()
+                telemetryJob = null
+                controlLoopJob = null
+                watchdogJob = null
                 clearNetworkResources()
                 runningConfig = null
                 persistEngineConfig(config, resume = false)
+                backgroundDiscoveryFailures = 0
+                nextDiscoveryAttemptAtMs = 0L
                 FlightSessionStore.update {
                     it.copy(
                         engineRunning = false,
@@ -431,6 +439,8 @@ class FlightEngineService : Service() {
         reconnectAttempt = 0
         lastReconnectAtMs = 0L
         lastAnyRxAtMs = 0L
+        backgroundDiscoveryFailures = 0
+        nextDiscoveryAttemptAtMs = 0L
         if (clearResumeFlag) {
             servicePrefs.edit().putBoolean(KEY_RESUME_ENGINE, false).apply()
             persistHomeReference(null)
@@ -506,61 +516,81 @@ class FlightEngineService : Service() {
 
             val now = System.currentTimeMillis()
             FlightSessionStore.update { it.copy(planeLinkPercent = computePlaneLinkPercent(now)) }
-            val reconnectReady = now - lastReconnectAtMs >= RECONNECT_COOLDOWN_MS
-            if (!reconnectReady) continue
 
             val noTelemetryMs = if (lastAnyRxAtMs > 0L) now - lastAnyRxAtMs else Long.MAX_VALUE
             val staleTelemetry = noTelemetryMs > TELEMETRY_TIMEOUT_MS
-            if (state.discoveryOk && staleTelemetry) {
-                performReconnect(config, "telemetry timeout ${noTelemetryMs}ms")
+            val reconnectReady = now - lastReconnectAtMs >= RECONNECT_COOLDOWN_MS
+
+            if (state.discoveryOk && (!state.transportReady || staleTelemetry)) {
+                if (!reconnectReady) continue
+                val reason = if (!state.transportReady) {
+                    "transport not ready"
+                } else {
+                    "telemetry timeout ${noTelemetryMs}ms"
+                }
+                performReconnect(config, reason, mode = ReconnectMode.FAST_BURST)
                 continue
             }
 
             if (!state.discoveryOk) {
-                performReconnect(config, "discovery not ok")
+                if (now < nextDiscoveryAttemptAtMs) continue
+                performReconnect(config, "discovery search", mode = ReconnectMode.BACKGROUND_SINGLE)
             }
         }
     }
 
-    private suspend fun performReconnect(config: FlightConfig, reason: String) {
+    private suspend fun performReconnect(config: FlightConfig, reason: String, mode: ReconnectMode) {
         reconnecting = true
         reconnectAttempt += 1
         lastReconnectAtMs = System.currentTimeMillis()
 
+        val attemptLabel = if (mode == ReconnectMode.FAST_BURST) "reconnect" else "discovery"
         FlightSessionStore.update {
             it.copy(
                 discoveryOk = false,
                 transportReady = false,
-                message = "reconnect #$reconnectAttempt: $reason",
+                message = "$attemptLabel #$reconnectAttempt: $reason",
             )
         }
-        refreshNotification("reconnect #$reconnectAttempt")
-        val result = reconnectTransport(config)
+        refreshNotification("$attemptLabel #$reconnectAttempt")
+        val result = reconnectTransport(config, mode = mode)
         if (result.ok) {
-            lastAnyRxAtMs = System.currentTimeMillis()
             reconnectAttempt = 0
-            FlightSessionStore.update {
-                it.copy(
-                    discoveryOk = true,
-                    transportReady = isTransportReady(),
-                    planeLinkPercent = 100,
-                    message = "reconnected",
-                )
-            }
-            refreshNotification("reconnected")
-            sendAllStates()
-            sendVideoEnable(true)
+            onTransportConnected(
+                config = config,
+                stateMessage = "reconnected",
+                notificationStatus = "reconnected",
+            )
         } else {
-            val failure = "reconnect failed: ${result.error ?: "no response"}"
-            FlightSessionStore.update {
-                it.copy(
-                    discoveryOk = false,
-                    transportReady = false,
-                    planeLinkPercent = 0,
-                    message = failure,
-                )
+            val error = result.error ?: "no response"
+            if (mode == ReconnectMode.BACKGROUND_SINGLE) {
+                backgroundDiscoveryFailures += 1
+                val backoffMs = backgroundDiscoveryBackoffMs(backgroundDiscoveryFailures)
+                nextDiscoveryAttemptAtMs = System.currentTimeMillis() + backoffMs
+                val waiting = "discovery retry in ${backoffMs / 1000L}s: $error"
+                FlightSessionStore.update {
+                    it.copy(
+                        discoveryOk = false,
+                        transportReady = false,
+                        planeLinkPercent = 0,
+                        message = waiting,
+                    )
+                }
+                refreshNotification(waiting)
+            } else {
+                backgroundDiscoveryFailures = 1
+                nextDiscoveryAttemptAtMs = System.currentTimeMillis() + DISCOVERY_BACKOFF_INITIAL_MS
+                val failure = "reconnect failed: $error"
+                FlightSessionStore.update {
+                    it.copy(
+                        discoveryOk = false,
+                        transportReady = false,
+                        planeLinkPercent = 0,
+                        message = failure,
+                    )
+                }
+                refreshNotification(failure)
             }
-            refreshNotification(failure)
         }
         reconnecting = false
     }
@@ -1126,7 +1156,10 @@ class FlightEngineService : Service() {
         }
     }
 
-    private suspend fun reconnectTransport(config: FlightConfig): DiscoveryResult {
+    private suspend fun reconnectTransport(
+        config: FlightConfig,
+        mode: ReconnectMode = ReconnectMode.FAST_BURST,
+    ): DiscoveryResult {
         return try {
             clearNetworkResources()
             targetAddress = InetAddress.getByName(config.discoIp)
@@ -1137,7 +1170,10 @@ class FlightEngineService : Service() {
                 bind(InetSocketAddress(config.d2cPort))
             }
 
-            val discovery = performDiscovery(config)
+            val discovery = when (mode) {
+                ReconnectMode.FAST_BURST -> performDiscovery(config)
+                ReconnectMode.BACKGROUND_SINGLE -> performDiscoverySingle(config)
+            }
             if (!discovery.ok) {
                 clearNetworkResources()
             }
@@ -1153,7 +1189,7 @@ class FlightEngineService : Service() {
 
         repeat(DISCOVERY_ATTEMPTS) { index ->
             val attempt = index + 1
-            val attemptResult = performDiscoveryOnce(config)
+            val attemptResult = performDiscoverySingle(config)
             if (attemptResult.ok) {
                 return attemptResult
             }
@@ -1168,7 +1204,7 @@ class FlightEngineService : Service() {
         return DiscoveryResult(ok = false, error = lastError)
     }
 
-    private fun performDiscoveryOnce(config: FlightConfig): DiscoveryResult {
+    private fun performDiscoverySingle(config: FlightConfig): DiscoveryResult {
         return try {
             Socket().use { socket ->
                 socket.connect(InetSocketAddress(config.discoIp, config.discoveryPort), 3000)
@@ -1191,6 +1227,54 @@ class FlightEngineService : Service() {
             }
         } catch (e: Exception) {
             DiscoveryResult(ok = false, error = e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    private fun onTransportConnected(
+        config: FlightConfig,
+        stateMessage: String,
+        notificationStatus: String,
+    ) {
+        lastAnyRxAtMs = System.currentTimeMillis()
+        reconnectAttempt = 0
+        reconnecting = false
+        lastReconnectAtMs = 0L
+        backgroundDiscoveryFailures = 0
+        nextDiscoveryAttemptAtMs = 0L
+
+        FlightSessionStore.update {
+            it.copy(
+                discoveryOk = true,
+                transportReady = isTransportReady(),
+                controlsArmed = controlsArmed,
+                planeLinkPercent = 100,
+                message = stateMessage,
+            )
+        }
+        refreshNotification(notificationStatus)
+
+        sendAllStates()
+        sendVideoEnable(true)
+        ensureDataLoopsRunning(config)
+    }
+
+    private fun ensureDataLoopsRunning(config: FlightConfig) {
+        if (telemetryJob?.isActive != true) {
+            telemetryJob = serviceScope.launch { telemetryLoop(config) }
+        }
+        if (controlLoopJob?.isActive != true) {
+            controlLoopJob = serviceScope.launch { controlLoop(config) }
+        }
+        if (watchdogJob?.isActive != true) {
+            watchdogJob = serviceScope.launch { watchdogLoop(config) }
+        }
+    }
+
+    private fun backgroundDiscoveryBackoffMs(failureCount: Int): Long {
+        return when {
+            failureCount <= 1 -> DISCOVERY_BACKOFF_INITIAL_MS
+            failureCount == 2 -> DISCOVERY_BACKOFF_MEDIUM_MS
+            else -> DISCOVERY_BACKOFF_MAX_MS
         }
     }
 
